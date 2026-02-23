@@ -1,200 +1,161 @@
-# SOSreport SAR Data Analyzer
+# SOSreport Analyzer V7
 
-A Python tool to parse SAR (System Activity Report) data from SOSreport files and push metrics to InfluxDB for visualization in Grafana.
+A **Streamlit web application** that analyzes Linux SOSreport archives — parsing SAR performance metrics and system logs, detecting critical events, and pushing everything to **InfluxDB + Loki + Grafana** for interactive visualization.
+
+Upload a `.tar.gz` / `.tar.xz` SOSreport and get instant analysis with auto-generated Grafana dashboards.
+
+## Architecture
+
+```
+┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+│  Streamlit   │────▶│  InfluxDB    │────▶│   Grafana    │
+│  Web App     │     │  (SAR data)  │     │  Dashboards  │
+│  :8501       │     │  :8086       │     │  :3000       │
+│              │────▶│  Loki        │────▶│              │
+│              │     │  (Logs)      │     │              │
+│              │     │  :3100       │     │              │
+└──────────────┘     └──────────────┘     └──────────────┘
+```
 
 ## Features
 
-- **Parse SAR data** from SOSreport directories
-- **Extract multiple metric types**:
-  - CPU utilization (`%user`, `%system`, `%iowait`, etc.)
-  - Memory usage (`kbmemfree`, `kbmemused`, `%memused`, etc.)
-  - Disk I/O (`tps`, `rd_sec/s`, `wr_sec/s`, etc.)
-  - Network traffic (`rxpck/s`, `txpck/s`, `rxkB/s`, `txkB/s`, etc.)
-  - System load (`ldavg-1`, `ldavg-5`, `ldavg-15`, etc.)
-- **Push metrics to InfluxDB** (time-series database)
-- **Generate Grafana dashboards** automatically
+### Analysis
+- **SAR Metrics Parsing** — CPU, memory, disk I/O, network, load, hugepages, NFS, sockets, context switches
+- **Log Parsing** — messages, syslog, secure, audit, dmesg, journalctl, kern, boot, maillog, yum/dnf
+- **Critical Event Detection** — 40+ regex patterns across 7 categories (disk, OOM, kernel panic, network, security, service, hardware)
+- **Severity Classification** — Events classified as critical/warning/info with noise filtering
+- **Performance Anomaly Detection** — Peaks, sustained high usage, IOWait spikes
+- **Timestamp Correlation** — Maps critical events to SAR metrics in ±5 min windows
+- **Patch Compliance Check** — Kernel age, security advisories, CVE extraction
+- **Crash Dump Discovery** — vmcore-dmesg analysis
+- **Cloud Provider Detection** — Azure/AWS/GCP/Oracle with provider-specific metadata
+- **OS Flavor Detection** — RHEL, Oracle Linux, SUSE, Ubuntu with per-distro kernel analysis
+
+### Performance (V7 Optimizations)
+- **Parallel SAR + Log parsing** — Runs concurrently (Step 7)
+- **Streaming file reads** — Generator-based, avoids loading entire files into memory (Step 8)
+- **Pre-compiled regex** — Single mega-regex pre-filter rejects 99%+ of lines instantly (Step 9)
+- **Multiprocessing for regex** — ProcessPoolExecutor bypasses GIL for large log sets (Step 10)
+- **Batched data push** — 10K batches, gzip compression, session pooling, retry with backoff
+- **ThreadPoolExecutor I/O** — Up to 8 workers for parallel log file decompression
+
+### Data Pipeline
+- **InfluxDB** — SAR time-series metrics with per-host tagging
+- **Loki** — Structured log storage with labels (host, source, program, severity)
+- **Grafana** — Auto-generated dashboards with CPU, memory, disk, network, load panels + log integration
+- **Cleanup on re-upload** — Deletes old InfluxDB + Loki data before pushing to avoid stale data
 
 ## Prerequisites
 
-1. **Python 3.8+**
-2. **InfluxDB 2.x** running and accessible
-3. **Grafana** (optional, for visualization)
+- **Python 3.8+**
+- **Docker Desktop** (for InfluxDB, Loki, Grafana)
 
-## Installation
+## Quick Start
+
+### 1. Clone and install
 
 ```bash
-# Clone or download the script
+git clone https://github.com/madamshafie_microsoft/sar_analyzer.git
 cd sar_analyzer
-
-# Install dependencies
 pip install -r requirements.txt
 ```
 
-## InfluxDB Setup
-
-1. Start InfluxDB and create an organization and bucket:
-   ```bash
-   # Create bucket via InfluxDB UI or CLI
-   influx bucket create --name sar_metrics --org your-org
-   ```
-
-2. Generate an API token with write access to the bucket
-
-## Usage
-
-### Basic Usage
+### 2. Configure environment
 
 ```bash
-python sar_analyzer.py /path/to/sosreport \
-    --hostname server01 \
-    --influx-token YOUR_INFLUXDB_TOKEN \
-    --influx-org your-organization
+cp .env.example .env
+# Edit .env with your actual tokens
 ```
 
-### All Options
+### 3. Start backend services
 
 ```bash
-python sar_analyzer.py /path/to/sosreport \
-    --hostname server01 \
-    --influx-url http://localhost:8086 \
-    --influx-token YOUR_INFLUXDB_TOKEN \
-    --influx-org your-organization \
-    --influx-bucket sar_metrics \
-    --generate-dashboard
+docker-compose up -d
 ```
 
-### Command Line Arguments
+This starts:
+| Service | Port | Purpose |
+|---------|------|---------|
+| **InfluxDB** | 8086 | SAR time-series storage |
+| **Loki** | 3100 | Log aggregation |
+| **Grafana** | 3000 | Dashboards & visualization |
 
-| Argument | Description | Default |
-|----------|-------------|---------|
-| `sosreport_path` | Path to extracted SOSreport directory | (required) |
-| `--hostname` | Hostname for tagging metrics | `unknown` |
-| `--influx-url` | InfluxDB server URL | `http://localhost:8086` |
-| `--influx-token` | InfluxDB API token | (required) |
-| `--influx-org` | InfluxDB organization | (required) |
-| `--influx-bucket` | InfluxDB bucket name | `sar_metrics` |
-| `--generate-dashboard` | Generate Grafana dashboard JSON | `False` |
-| `--dry-run` | Parse data without pushing to InfluxDB | `False` |
-
-### Dry Run Mode
-
-Test the parser without sending data to InfluxDB:
+### 4. Run the web app
 
 ```bash
-python sar_analyzer.py /path/to/sosreport --dry-run
+streamlit run streamlit_app_v7.local.py --server.port 8501
 ```
 
-## SOSreport SAR File Locations
+Open **http://localhost:8501** and upload a SOSreport archive.
 
-The tool searches for SAR data in these locations within the SOSreport:
+## Configuration
 
+All secrets are stored in `.env` (not committed to git):
+
+```env
+# InfluxDB
+INFLUXDB_URL=http://localhost:8086
+INFLUXDB_TOKEN=your-influxdb-token
+INFLUXDB_ORG_ID=your-org-id
+INFLUXDB_BUCKET=sar_metrics
+
+# Loki
+LOKI_URL=http://localhost:3100
+
+# Grafana
+GRAFANA_URL=http://localhost:3000
+GRAFANA_API_KEY=your-grafana-api-key
+```
+
+See [.env.example](.env.example) for the template.
+
+## Files
+
+| File | Description |
+|------|-------------|
+| `streamlit_app_v7.local.py` | **Main app** — local Docker version |
+| `streamlit_app_v7.py` | Remote/cloud version (Azure endpoints) |
+| `docker-compose.yml` | InfluxDB + Loki + Grafana stack |
+| `loki-config.yaml` | Loki configuration (retention, ingestion, delete API) |
+| `.env.example` | Environment variable template |
+| `requirements.txt` | Python dependencies |
+| `streamlit_app_v[1-6].py` | Legacy versions (kept for reference) |
+
+## SOSreport File Locations
+
+The tool searches for data in these paths within the extracted SOSreport:
+
+**SAR data:**
 - `sos_commands/sar/*`
-- `var/log/sa/*`
-- `sar/*`
+- `var/log/sa/*` (binary sa files + XML)
 
-## Grafana Dashboard
+**Log files:**
+- `var/log/messages*`, `var/log/syslog*`, `var/log/secure*`
+- `var/log/audit/audit.log*`
+- `var/log/kern.log*`, `var/log/boot.log`, `var/log/cron*`
+- `var/log/yum.log`, `var/log/dnf.log`
+- `sos_commands/kernel/dmesg*`
+- `sos_commands/logs/journalctl*`
 
-When using `--generate-dashboard`, a JSON file will be created that can be imported into Grafana:
+## Grafana
 
-1. Open Grafana → Dashboards → Import
-2. Upload the generated `grafana_dashboard_<hostname>.json`
-3. Configure InfluxDB data source if not already done
-
-## Example Output
+After uploading a SOSreport, a Grafana dashboard is auto-created at:
 
 ```
-============================================================
-SOSreport SAR Data Analyzer
-============================================================
-
-Found 3 SAR files
-Parsing: /path/sosreport/sos_commands/sar/sar
-  Extracted 1542 metrics
-Parsing: /path/sosreport/sos_commands/sar/sar_-r
-  Extracted 288 metrics
-Parsing: /path/sosreport/sos_commands/sar/sar_-b
-  Extracted 144 metrics
-
-Total metrics extracted: 1974
-
-Metrics by type:
-  cpu: 1152
-  disk: 288
-  load: 144
-  memory: 288
-  network: 102
-
-============================================================
-Pushing to InfluxDB
-============================================================
-
-Connected to InfluxDB at http://localhost:8086
-Pushing 1974 metrics to InfluxDB...
-  Progress: 1000/1974 (50%)
-  Progress: 1974/1974 (100%)
-Successfully pushed 1974 metrics to InfluxDB
-Disconnected from InfluxDB
-
-============================================================
-Done!
-============================================================
+http://localhost:3000/d/web-<hostname>/
 ```
 
-## InfluxDB Data Structure
-
-Metrics are stored with the following structure:
-
-- **Measurement**: `sar_<type>` (e.g., `sar_cpu`, `sar_memory`)
-- **Tags**:
-  - `host`: Server hostname
-  - `cpu`: CPU ID (for CPU metrics)
-  - `device`: Device name (for disk metrics)
-  - `interface`: Network interface (for network metrics)
-- **Fields**: The actual metric values
-- **Timestamp**: Original SAR timestamp
-
-## Grafana Queries
-
-Example InfluxDB Flux queries for Grafana:
-
-### CPU Usage
-```flux
-from(bucket: "sar_metrics")
-  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)
-  |> filter(fn: (r) => r._measurement == "sar_cpu")
-  |> filter(fn: (r) => r.cpu == "all")
-  |> filter(fn: (r) => r._field == "pct_user" or r._field == "pct_system")
-```
-
-### Memory Usage
-```flux
-from(bucket: "sar_metrics")
-  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)
-  |> filter(fn: (r) => r._measurement == "sar_memory")
-  |> filter(fn: (r) => r._field == "pct_memused")
-```
-
-### Load Average
-```flux
-from(bucket: "sar_metrics")
-  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)
-  |> filter(fn: (r) => r._measurement == "sar_load")
-  |> filter(fn: (r) => r._field =~ /ldavg_/)
-```
+Panels include: CPU usage (stacked), memory, disk I/O, network, load average, system logs (via Loki).
 
 ## Troubleshooting
 
-### No SAR files found
-- Ensure the SOSreport is extracted
-- Check the directory structure matches expected paths
-
-### Connection refused to InfluxDB
-- Verify InfluxDB is running: `influx ping`
-- Check the URL and port
-
-### Authentication errors
-- Verify the API token has write permissions
-- Check the organization name
+| Problem | Solution |
+|---------|----------|
+| No SAR files found | Ensure SOSreport is a valid `.tar.gz`/`.tar.xz` |
+| InfluxDB connection refused | Run `docker-compose up -d` and check port 8086 |
+| Loki "entry too far behind" | App auto-cleans old data; restart Loki if persists |
+| Grafana 401 Unauthorized | Regenerate API key in Grafana → Service Accounts |
+| Slow parsing (>10 min) | Normal for 70MB+ sosreports; V7 optimizations help |
 
 ## License
 
