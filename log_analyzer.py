@@ -6,11 +6,11 @@ Parses log files from SOSreport and pushes to Loki for visualization in Grafana
 # ============================================================================
 # LOKI CONFIGURATION
 # ============================================================================
-LOKI_URL = "http://74.224.124.196:3100"       # Loki server URL
+LOKI_URL = "http://localhost:3100"       # Loki server URL
 # ============================================================================
 # GRAFANA CONFIGURATION
 # ============================================================================
-GRAFANA_URL = "http://74.224.124.196:3000"
+GRAFANA_URL = "http://localhost:3000"
 GRAFANA_API_KEY = "YOUR_GRAFANA_API_KEY"
 # ============================================================================
 

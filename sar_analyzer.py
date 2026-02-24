@@ -5,14 +5,14 @@ Parses SAR data from SOSreport and pushes metrics to InfluxDB for Grafana visual
 # ============================================================================
 # INFLUXDB CONFIGURATION - Set your defaults here to avoid passing arguments
 # ============================================================================
-INFLUXDB_URL = "http://74.224.124.196:8086"
+INFLUXDB_URL = "http://localhost:8086"
 INFLUXDB_TOKEN = "YOUR_INFLUXDB_TOKEN"
 INFLUXDB_ORG = "889b684a77fa68d6"
 INFLUXDB_BUCKET = "sar_metrics"
 # ============================================================================
 # GRAFANA CONFIGURATION - For automatic dashboard import
 # ============================================================================
-GRAFANA_URL = "http://74.224.124.196:3000"   # Grafana server URL
+GRAFANA_URL = "http://localhost:3000"   # Grafana server URL
 GRAFANA_API_KEY = "YOUR_GRAFANA_API_KEY"  # Grafana API key
 GRAFANA_USER = "admin"                        # Or use basic auth: username
 GRAFANA_PASSWORD = "admin"                    # Or use basic auth: password

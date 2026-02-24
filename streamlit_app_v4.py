@@ -31,14 +31,14 @@ import pandas as pd
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-INFLUXDB_URL = "http://74.224.124.196:8086"
+INFLUXDB_URL = "http://localhost:8086"
 INFLUXDB_TOKEN = "YOUR_INFLUXDB_TOKEN"
 INFLUXDB_ORG = "889b684a77fa68d6"
 INFLUXDB_BUCKET = "sar_metrics"
 
-LOKI_URL = "http://74.224.124.196:3100"
+LOKI_URL = "http://localhost:3100"
 
-GRAFANA_URL = "https://grafanaa-dsg4dcc2cfh9b6db.cin.grafana.azure.com"
+GRAFANA_URL = "http://localhost:3000"
 GRAFANA_API_KEY = "YOUR_GRAFANA_API_KEY"
 
 # Performance Configuration
