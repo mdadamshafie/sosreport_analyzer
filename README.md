@@ -66,7 +66,7 @@ No Python install needed on the host.
    ```
 2. **Clone the repo** (in Windows or inside WSL):
    ```bash
-   git clone https://github.com/madamshafie_microsoft/sar_analyzer.git
+   git clone https://github.com/mdadamshafie/sar_analyzer.git
    ```
 3. **Double-click `start.bat`** — or run from PowerShell:
    ```powershell
@@ -81,7 +81,7 @@ No Python install needed on the host.
 ### Option B: Linux / macOS (or WSL shell directly)
 
 ```bash
-git clone https://github.com/madamshafie_microsoft/sar_analyzer.git
+git clone https://github.com/mdadamshafie/sar_analyzer.git
 cd sar_analyzer
 chmod +x setup.sh
 ./setup.sh
@@ -127,7 +127,7 @@ If you prefer running the Streamlit app outside Docker (hot-reload, debugging):
 ### 1. Clone and install
 
 ```bash
-git clone https://github.com/madamshafie_microsoft/sar_analyzer.git
+git clone https://github.com/mdadamshafie/sar_analyzer.git
 cd sar_analyzer
 pip install -r requirements.txt
 ```
