@@ -1,6 +1,7 @@
 """
-SOSreport Analyzer V7 - Streamlit Web Application
-Upload SOSreport files and analyze SAR metrics + Logs with automatic Grafana integration
+SOSreport & Supportconfig Analyzer V7.2 - Streamlit Web Application
+Upload SOSreport (RHEL/OL/CentOS) or Supportconfig (SUSE/SLES) archives and analyze
+SAR metrics + Logs with automatic Grafana integration.
 
 Multi-user optimized with caching and resource management.
 Includes:
@@ -20,6 +21,8 @@ Includes:
 - CVE extraction from DNF/YUM security advisories (NEW in V7)
 - Crash dump discovery with vmcore-dmesg analysis (NEW in V7)
 - NetworkManager deep analysis (NEW in V7)
+- System Health Checks — 30+ categorized checks (V7.1)
+- SUSE Supportconfig archive support — auto-detect format, parse flat .txt files (V7.2)
 """
 
 import streamlit as st
@@ -63,6 +66,183 @@ MAX_CONCURRENT_EXTRACTIONS = 3  # Limit concurrent heavy operations
 MAX_LOG_LINES = 2000000  # Limit log lines (increased from 500K)
 MAX_SAR_METRICS = 1000000  # Limit SAR metrics
 EXTRACTION_TIMEOUT = 300  # 5 minute timeout for extraction
+
+# ============================================================================
+# SUPPORTCONFIG / SOSREPORT FORMAT HANDLING (V7.2)
+# ============================================================================
+
+# Supportconfig files use section delimiters like:
+#   #==[ Command ]======#
+#   # /usr/bin/hostname
+#   <output lines>
+#   #==[ Next Command ]======#
+_SC_SECTION_RE = re.compile(r'^#==\[\s*(.*?)\s*\]=+#\s*$')
+_SC_COMMAND_RE = re.compile(r'^#\s*(/\S+.*?)\s*$')
+
+# Mapping: data need → supportconfig file → command/section to extract
+# Each entry: (sc_filename, command_prefix_or_section)  — None means whole file
+_SC_FILE_MAP = {
+    # System basics
+    'hostname':     ('basic-environment.txt', '/bin/hostname'),
+    'uptime':       ('basic-environment.txt', '/usr/bin/uptime'),
+    'uname':        ('basic-environment.txt', '/bin/uname'),
+    'date':         ('basic-environment.txt', '/bin/date'),
+    'lscpu':        ('hardware.txt',          '/usr/bin/lscpu'),
+    'cpuinfo':      ('hardware.txt',          '/proc/cpuinfo'),
+    'meminfo':      ('memory.txt',            '/proc/meminfo'),
+    'free':         ('basic-environment.txt', '/usr/bin/free'),
+    'df':           ('fs-diskio.txt',         '/bin/df'),
+    'ps':           ('basic-environment.txt', '/bin/ps'),
+    'last_reboot':  ('basic-environment.txt', '/usr/bin/last'),
+    'sysctl':       ('env.txt',               '/sbin/sysctl'),
+    'dmidecode':    ('hardware.txt',          '/usr/sbin/dmidecode'),
+    'cmdline':      ('boot.txt',              '/proc/cmdline'),
+    'os_release':   ('basic-environment.txt', '/etc/os-release'),
+    'suse_release': ('basic-environment.txt', '/etc/SuSE-release'),
+    'rpm_list':     ('rpm.txt',               None),   # whole file
+    'sar_data':     ('sar.txt',               None),   # whole file
+    # Logs
+    'messages':     ('messages.txt',          None),
+    'boot_log':     ('boot.txt',              None),
+    'warn_log':     ('warn.txt',              None),
+    'security':     ('security.txt',          None),
+    # Network
+    'ip_addr':      ('network.txt',           '/sbin/ip addr'),
+    'ip_route':     ('network.txt',           '/sbin/ip route'),
+    'resolv_conf':  ('network.txt',           '/etc/resolv.conf'),
+    'firewall':     ('network.txt',           '/usr/bin/firewall-cmd'),
+    'ethtool':      ('network.txt',           '/usr/sbin/ethtool'),
+    # Kernel / Boot
+    'dmesg':        ('boot.txt',              '/bin/dmesg'),
+    'modules':      ('boot.txt',              '/sbin/lsmod'),
+    'kdump':        ('crash.txt',             None),
+    # Service mgmt
+    'systemd':      ('systemd.txt',           None),
+    'systemctl':    ('systemd.txt',           '/usr/bin/systemctl'),
+    # Storage
+    'lvm':          ('lvm.txt',               None),
+    'lsblk':        ('fs-diskio.txt',         '/bin/lsblk'),
+    'fstab':        ('fs-diskio.txt',         '/etc/fstab'),
+    # HA / Cluster
+    'ha_log':       ('ha.txt',                None),
+    # Updates
+    'updates':      ('updates.txt',           None),
+    'zypper_log':   ('updates.txt',           '/usr/bin/zypper'),
+    # THP
+    'thp_enabled':  ('memory.txt',            '/sys/kernel/mm/transparent_hugepage/enabled'),
+    'thp_defrag':   ('memory.txt',            '/sys/kernel/mm/transparent_hugepage/defrag'),
+    # SELinux / AppArmor
+    'apparmor':     ('security.txt',          '/usr/sbin/apparmor_status'),
+    'sestatus':     ('security.txt',          '/usr/sbin/sestatus'),
+    # SSH
+    'sshd_config':  ('security.txt',          '/etc/ssh/sshd_config'),
+    # Audit
+    'auditd_conf':  ('security.txt',          '/etc/audit/auditd.conf'),
+}
+
+
+def detect_archive_format(root_path: str) -> str:
+    """Detect if extracted archive is a sosreport or supportconfig.
+    
+    Returns: 'sosreport', 'supportconfig', or 'unknown'
+    """
+    # Supportconfig: flat directory with characteristic .txt files
+    sc_markers = ['basic-environment.txt', 'hardware.txt', 'messages.txt', 'rpm.txt']
+    if sum(1 for m in sc_markers if os.path.isfile(os.path.join(root_path, m))) >= 2:
+        return 'supportconfig'
+    
+    # SOSreport: has sos_commands/ or var/log layout
+    if os.path.isdir(os.path.join(root_path, 'sos_commands')):
+        return 'sosreport'
+    if os.path.isdir(os.path.join(root_path, 'var', 'log')):
+        return 'sosreport'
+    
+    return 'unknown'
+
+
+def sc_extract_section(filepath: str, command_prefix: str) -> str:
+    """Extract a specific section from a supportconfig multi-section .txt file.
+    
+    Supportconfig files have sections delimited by:
+        #==[ <Type> ]======#
+        # /path/to/command [args]
+        <output>
+    
+    This extracts the output block for the section whose command line starts with
+    `command_prefix`.  Returns empty string if not found.
+    """
+    if not os.path.isfile(filepath):
+        return ''
+    try:
+        with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+            lines = f.readlines()
+    except Exception:
+        return ''
+    
+    capturing = False
+    result = []
+    for i, line in enumerate(lines):
+        # Check for section delimiter
+        m = _SC_SECTION_RE.match(line)
+        if m:
+            if capturing:
+                break  # end of our section
+            # Next line(s) should have the command
+            capturing = False
+            # Look ahead for the command line
+            for j in range(i + 1, min(i + 4, len(lines))):
+                cmd_m = _SC_COMMAND_RE.match(lines[j])
+                if cmd_m:
+                    cmd = cmd_m.group(1)
+                    if cmd.startswith(command_prefix) or command_prefix in cmd:
+                        capturing = True
+                    break
+            continue
+        
+        if capturing:
+            # Skip comment lines at the start of the section
+            if line.startswith('#') and not result:
+                continue
+            result.append(line)
+    
+    return ''.join(result).strip()
+
+
+def sc_read_file(root_path: str, data_key: str) -> str:
+    """Read data from a supportconfig archive using the file map.
+    
+    Args:
+        root_path: path to extracted supportconfig directory
+        data_key: a key from _SC_FILE_MAP (e.g. 'hostname', 'meminfo', 'df')
+    
+    Returns the extracted text, or empty string if not found.
+    """
+    mapping = _SC_FILE_MAP.get(data_key)
+    if not mapping:
+        return ''
+    
+    sc_file, command = mapping
+    filepath = os.path.join(root_path, sc_file)
+    
+    if not os.path.isfile(filepath):
+        return ''
+    
+    if command is None:
+        # Read entire file
+        try:
+            with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                return f.read()
+        except Exception:
+            return ''
+    else:
+        return sc_extract_section(filepath, command)
+
+
+def sc_find_file(root_path: str, filename: str) -> str:
+    """Find a file in a supportconfig flat directory. Returns path or ''."""
+    path = os.path.join(root_path, filename)
+    return path if os.path.isfile(path) else ''
+
 
 # Refined Critical Events Log Patterns for V7
 LOG_PATTERNS = {
@@ -317,7 +497,7 @@ _active_sessions_lock = threading.Lock()
 _active_sessions = {}  # session_id -> {hostname, start_time, phase}
 
 st.set_page_config(
-    page_title="SOSreport Analyzer V7",
+    page_title="SOSreport & Supportconfig Analyzer V7.2",
     
     layout="wide",
     initial_sidebar_state="expanded"
@@ -390,7 +570,14 @@ def get_file_hash(uploaded_file) -> str:
 
 
 def extract_sosreport(uploaded_file, progress_bar, status_text=None) -> Tuple[str, str]:
-    """Extract uploaded sosreport to temp directory with concurrency control"""
+    """Extract uploaded sosreport or supportconfig to temp directory with concurrency control.
+    
+    Supports:
+      - SOSreport (.tar.gz/.tar.xz) from RHEL/OL/CentOS/Rocky/Alma
+      - Supportconfig (.tar.gz/.tar.xz/.txz) from SUSE/SLES
+    
+    Returns (temp_dir, root_dir) where root_dir is the extracted content root.
+    """
     
     # Acquire semaphore to limit concurrent extractions
     if status_text:
@@ -411,11 +598,12 @@ def extract_sosreport(uploaded_file, progress_bar, status_text=None) -> Tuple[st
         progress_bar.progress(20, f"Extracting archive ({file_size_mb:.1f} MB)...")
         
         # Determine compression type
-        if uploaded_file.name.endswith('.tar.xz'):
+        fname = uploaded_file.name.lower()
+        if fname.endswith('.tar.xz') or fname.endswith('.txz'):
             mode = 'r:xz'
-        elif uploaded_file.name.endswith(('.tar.gz', '.tgz')):
+        elif fname.endswith(('.tar.gz', '.tgz')):
             mode = 'r:gz'
-        elif uploaded_file.name.endswith('.tar.bz2'):
+        elif fname.endswith('.tar.bz2'):
             mode = 'r:bz2'
         else:
             mode = 'r'
@@ -435,72 +623,109 @@ def extract_sosreport(uploaded_file, progress_bar, status_text=None) -> Tuple[st
                         top_dir = m.name
                         break
                 
-                # Extract relevant files - SAR, logs, system info, and hostname
-                files_to_extract = []
-                for member in members:
-                    name = member.name
-                    # Include SAR files, all log files, system info, and hostname
-                # Also extract /sos_commands/subscription_manager, /sos_commands/yum, /sos_commands/dnf
-                    if any(p in name for p in [
-                        '/var/log/sa/',        # SAR binary and text files
-                        '/sos_commands/sar/',  # SAR command outputs
-                        '/sos_commands/logs/',
-                        '/sos_commands/auditd/',
-                        '/sos_commands/date/',  # Date command output
-                        '/sos_commands/general/', # General commands (uptime, etc)
-                        '/sos_commands/host/',  # Host commands
-                        '/sos_commands/kernel/',  # Kernel version, modules
-                        '/sos_commands/filesys/',  # df, mount info
-                        '/sos_commands/process/',  # ps, top outputs
-                        '/sos_commands/rpm/',  # Installed packages
-                        '/sos_commands/hardware/',  # Hardware info
-                        '/sos_commands/memory/',  # Memory details
-                        '/sos_commands/processor/',  # CPU details
-                        '/sos_commands/subscription_manager/',  # Subscription info (V5)
-                        '/sos_commands/yum/',  # Yum history (V5)
-                        '/sos_commands/dnf/',  # DNF history (V5)
-                        '/sos_commands/kdump/',  # Kdump status (V5)
-                        '/sos_commands/systemd/',  # Systemd service status (V5)
-                        '/sos_commands/azure/',  # Azure instance metadata (V7)
-                        '/etc/kdump.conf',  # Kdump config (V5)
-                        '/var/crash/',  # Crash dumps (V5)
-                        '/proc/cmdline',  # Kernel cmdline for crashkernel= (V5)
-                        '/proc/cpuinfo',  # CPU info
-                        '/proc/meminfo',  # Memory info
-                        '/etc/hostname',
-                        '/etc/redhat-release',  # OS release info
-                        '/etc/centos-release',
-                        '/etc/system-release',
-                        '/etc/os-release',
-                        '/etc/oracle-release',
-                        '/hostname',
-                        '/uptime',
-                        '/date',
-                        '/uname',
-                        '/dmidecode',
-                        '/free',
-                        '/df',
-                        '/lscpu',
-                    ]):
-                        if len(os.path.join(temp_dir, name)) < 250:
+                # Quick-detect if this is a supportconfig archive
+                _is_supportconfig = any(
+                    m.name.endswith('basic-environment.txt') or
+                    m.name.endswith('hardware.txt') or
+                    m.name.endswith('messages.txt')
+                    for m in members[:50]
+                )
+                
+                if _is_supportconfig:
+                    # Supportconfig: extract ALL .txt files and any var/log/  
+                    # Supportconfig archives are flat — extract everything
+                    files_to_extract = []
+                    for member in members:
+                        name = member.name
+                        if member.isdir():
                             files_to_extract.append(member)
-                    # Extract ALL files under /var/log/ (not just specific ones)
-                    elif '/var/log/' in name and not member.isdir():
-                        if len(os.path.join(temp_dir, name)) < 250:
+                        elif name.endswith('.txt') or name.endswith('.log') or name.endswith('.xml'):
+                            if len(os.path.join(temp_dir, name)) < 250:
+                                files_to_extract.append(member)
+                        elif '/var/log/' in name or '/var/crash/' in name or '/etc/' in name:
+                            if len(os.path.join(temp_dir, name)) < 250:
+                                files_to_extract.append(member)
+                else:
+                    # SOSreport: selective extraction (original logic)
+                    files_to_extract = []
+                    for member in members:
+                        name = member.name
+                        if any(p in name for p in [
+                            '/var/log/sa/',
+                            '/sos_commands/sar/',
+                            '/sos_commands/logs/',
+                            '/sos_commands/auditd/',
+                            '/sos_commands/date/',
+                            '/sos_commands/general/',
+                            '/sos_commands/host/',
+                            '/sos_commands/kernel/',
+                            '/sos_commands/filesys/',
+                            '/sos_commands/process/',
+                            '/sos_commands/rpm/',
+                            '/sos_commands/hardware/',
+                            '/sos_commands/memory/',
+                            '/sos_commands/processor/',
+                            '/sos_commands/subscription_manager/',
+                            '/sos_commands/yum/',
+                            '/sos_commands/dnf/',
+                            '/sos_commands/kdump/',
+                            '/sos_commands/systemd/',
+                            '/sos_commands/azure/',
+                            '/sos_commands/networking/',
+                            '/sos_commands/selinux/',
+                            '/sos_commands/firewalld/',
+                            '/sos_commands/networkmanager/',
+                            '/sos_commands/pacemaker/',
+                            '/sos_commands/cluster/',
+                            '/sos_commands/cloud/',
+                            '/sos_commands/cloud_init/',
+                            '/etc/kdump.conf',
+                            '/var/crash/',
+                            '/proc/cmdline',
+                            '/proc/cpuinfo',
+                            '/proc/meminfo',
+                            '/etc/hostname',
+                            '/etc/redhat-release',
+                            '/etc/centos-release',
+                            '/etc/system-release',
+                            '/etc/os-release',
+                            '/etc/oracle-release',
+                            '/etc/SuSE-release',
+                            '/etc/fstab',
+                            '/etc/ssh/sshd_config',
+                            '/etc/audit/auditd.conf',
+                            '/etc/waagent.conf',
+                            '/etc/cloud/',
+                            '/etc/netplan/',
+                            '/etc/sysconfig/network-scripts/',
+                            '/etc/network/interfaces',
+                            '/etc/NetworkManager/',
+                            '/hostname',
+                            '/uptime',
+                            '/date',
+                            '/uname',
+                            '/dmidecode',
+                            '/free',
+                            '/df',
+                            '/lscpu',
+                        ]):
+                            if len(os.path.join(temp_dir, name)) < 250:
+                                files_to_extract.append(member)
+                        elif '/var/log/' in name and not member.isdir():
+                            if len(os.path.join(temp_dir, name)) < 250:
+                                files_to_extract.append(member)
+                        elif member.isdir() and any(p in name for p in [
+                            '/var/log/sa', '/var/log/audit', '/var/log', '/var',
+                            '/sos_commands/sar', '/sos_commands/logs', '/sos_commands',
+                            '/sos_commands/date', '/sos_commands/general', '/sos_commands/host',
+                            '/sos_commands/process',
+                            '/sos_commands/subscription_manager', '/sos_commands/yum', '/sos_commands/dnf',
+                            '/sos_commands/kdump', '/sos_commands/systemd',
+                            '/sos_commands/azure',
+                            '/var/crash',
+                            '/etc'
+                        ]):
                             files_to_extract.append(member)
-                    # Also extract directory structure
-                    elif member.isdir() and any(p in name for p in [
-                        '/var/log/sa', '/var/log/audit', '/var/log', '/var',
-                        '/sos_commands/sar', '/sos_commands/logs', '/sos_commands',
-                        '/sos_commands/date', '/sos_commands/general', '/sos_commands/host',
-                        '/sos_commands/process',
-                        '/sos_commands/subscription_manager', '/sos_commands/yum', '/sos_commands/dnf',
-                        '/sos_commands/kdump', '/sos_commands/systemd',
-                        '/sos_commands/azure',
-                        '/var/crash',
-                        '/etc'
-                    ]):
-                        files_to_extract.append(member)
                 
                 # Include top directory
                 for member in members:
@@ -530,11 +755,241 @@ def extract_sosreport(uploaded_file, progress_bar, status_text=None) -> Tuple[st
                 pass
         
         sosreport_dir = os.path.join(temp_dir, top_dir) if top_dir else temp_dir
+        
+        # Detect format and materialize paths for supportconfig
+        _fmt = detect_archive_format(sosreport_dir)
+        if _fmt == 'supportconfig':
+            _materialize_supportconfig_paths(sosreport_dir)
+        
         return temp_dir, sosreport_dir
 
 
-def detect_hostname(sosreport_path: str) -> str:
-    """Detect hostname from sosreport"""
+def _materialize_supportconfig_paths(sc_root: str):
+    """For supportconfig archives, extract sections from flat .txt files and write
+    them to the paths that the existing detect_* functions expect.
+    
+    This bridge function lets ALL existing sosreport detection logic work unchanged
+    with supportconfig archives.
+    """
+    def _write(relpath: str, content: str):
+        if not content:
+            return
+        dest = os.path.join(sc_root, relpath)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        try:
+            with open(dest, 'w', encoding='utf-8') as f:
+                f.write(content)
+        except Exception:
+            pass
+
+    # ── System basics ───────────────────────────────────────
+    _write('etc/hostname',
+           sc_read_file(sc_root, 'hostname'))
+    _write('uptime',
+           sc_read_file(sc_root, 'uptime'))
+    _write('date',
+           sc_read_file(sc_root, 'date'))
+
+    # OS release
+    os_release = sc_read_file(sc_root, 'os_release')
+    if os_release:
+        _write('etc/os-release', os_release)
+    suse_release = sc_read_file(sc_root, 'suse_release')
+    if suse_release:
+        _write('etc/SuSE-release', suse_release)
+
+    # Kernel
+    uname = sc_read_file(sc_root, 'uname')
+    if uname:
+        _write('sos_commands/kernel/uname_-a', uname)
+        _write('uname', uname)
+    cmdline = sc_read_file(sc_root, 'cmdline')
+    if cmdline:
+        _write('proc/cmdline', cmdline.strip().splitlines()[0] if cmdline.strip() else '')
+
+    # CPU
+    lscpu = sc_read_file(sc_root, 'lscpu')
+    if lscpu:
+        _write('sos_commands/processor/lscpu', lscpu)
+        _write('lscpu', lscpu)
+    cpuinfo = sc_read_file(sc_root, 'cpuinfo')
+    if cpuinfo:
+        _write('proc/cpuinfo', cpuinfo)
+
+    # Memory
+    meminfo = sc_read_file(sc_root, 'meminfo')
+    if meminfo:
+        _write('proc/meminfo', meminfo)
+    free_out = sc_read_file(sc_root, 'free')
+    if free_out:
+        _write('free', free_out)
+    thp_e = sc_read_file(sc_root, 'thp_enabled')
+    if thp_e:
+        _write('sys/kernel/mm/transparent_hugepage/enabled', thp_e)
+    thp_d = sc_read_file(sc_root, 'thp_defrag')
+    if thp_d:
+        _write('sys/kernel/mm/transparent_hugepage/defrag', thp_d)
+
+    # Sysctl
+    sysctl = sc_read_file(sc_root, 'sysctl')
+    if sysctl:
+        _write('sos_commands/kernel/sysctl_-a', sysctl)
+
+    # Filesystem
+    df_out = sc_read_file(sc_root, 'df')
+    if df_out:
+        _write('sos_commands/filesys/df_-h', df_out)
+        _write('df', df_out)
+    fstab = sc_read_file(sc_root, 'fstab')
+    if fstab:
+        _write('etc/fstab', fstab)
+    lsblk = sc_read_file(sc_root, 'lsblk')
+    if lsblk:
+        _write('sos_commands/block/lsblk', lsblk)
+
+    # Packages
+    rpm_list = sc_read_file(sc_root, 'rpm_list')
+    if rpm_list:
+        _write('installed-rpms', rpm_list)
+
+    # Processes
+    ps_out = sc_read_file(sc_root, 'ps')
+    if ps_out:
+        _write('ps', ps_out)
+
+    # dmidecode
+    dmi = sc_read_file(sc_root, 'dmidecode')
+    if dmi:
+        _write('dmidecode', dmi)
+        _write('sos_commands/hardware/dmidecode', dmi)
+
+    # Dmesg
+    dmesg = sc_read_file(sc_root, 'dmesg')
+    if dmesg:
+        _write('sos_commands/kernel/dmesg', dmesg)
+
+    # Modules
+    lsmod = sc_read_file(sc_root, 'modules')
+    if lsmod:
+        _write('sos_commands/kernel/lsmod', lsmod)
+
+    # Network
+    ip_addr = sc_read_file(sc_root, 'ip_addr')
+    if ip_addr:
+        _write('sos_commands/networking/ip_-d_address', ip_addr)
+    ip_route = sc_read_file(sc_root, 'ip_route')
+    if ip_route:
+        _write('sos_commands/networking/ip_route', ip_route)
+    resolv = sc_read_file(sc_root, 'resolv_conf')
+    if resolv:
+        _write('etc/resolv.conf', resolv)
+
+    # Kdump / crash
+    kdump = sc_read_file(sc_root, 'kdump')
+    if kdump:
+        _write('sos_commands/kdump/kdumpctl_status', kdump)
+
+    # Systemd
+    systemctl = sc_read_file(sc_root, 'systemctl')
+    if systemctl:
+        _write('sos_commands/systemd/systemctl_list-units', systemctl)
+    systemd_full = sc_read_file(sc_root, 'systemd')
+    if systemd_full:
+        _write('sos_commands/systemd/systemd_info.txt', systemd_full)
+
+    # Security / SSH / Audit
+    sshd = sc_read_file(sc_root, 'sshd_config')
+    if sshd:
+        _write('etc/ssh/sshd_config', sshd)
+    auditd = sc_read_file(sc_root, 'auditd_conf')
+    if auditd:
+        _write('etc/audit/auditd.conf', auditd)
+    sestatus = sc_read_file(sc_root, 'sestatus')
+    if sestatus:
+        _write('sos_commands/selinux/sestatus', sestatus)
+    apparmor = sc_read_file(sc_root, 'apparmor')
+    if apparmor:
+        _write('sos_commands/apparmor/apparmor_status', apparmor)
+
+    # SAR data — sar.txt is a flat file with all sar -A output
+    sar_txt = sc_find_file(sc_root, 'sar.txt')
+    if sar_txt:
+        # Copy to sos_commands/sar/ so SAR parser finds it
+        os.makedirs(os.path.join(sc_root, 'sos_commands', 'sar'), exist_ok=True)
+        try:
+            shutil.copy2(sar_txt, os.path.join(sc_root, 'sos_commands', 'sar', 'sar.txt'))
+        except Exception:
+            pass
+
+    # Logs — messages.txt, warn.txt, boot.txt map to var/log equivalents
+    for sc_file, var_log_name in [
+        ('messages.txt', 'var/log/messages'),
+        ('warn.txt', 'var/log/warn'),
+        ('boot.txt', 'var/log/boot.log'),
+    ]:
+        src = sc_find_file(sc_root, sc_file)
+        if src:
+            dest_path = os.path.join(sc_root, var_log_name)
+            os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+            try:
+                # For messages.txt, extract only actual log lines (skip section headers)
+                with open(src, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read()
+                # Strip supportconfig section headers
+                log_lines = []
+                for line in content.splitlines():
+                    if not _SC_SECTION_RE.match(line) and not line.startswith('# /'):
+                        log_lines.append(line)
+                with open(dest_path, 'w', encoding='utf-8') as f:
+                    f.write('\n'.join(log_lines))
+            except Exception:
+                pass
+
+    # security.txt contains audit log, secure log, etc.
+    security_src = sc_find_file(sc_root, 'security.txt')
+    if security_src:
+        _write('var/log/secure',
+               sc_read_file(sc_root, 'security'))
+
+    # HA / Pacemaker
+    ha_src = sc_find_file(sc_root, 'ha.txt')
+    if ha_src:
+        os.makedirs(os.path.join(sc_root, 'sos_commands', 'pacemaker'), exist_ok=True)
+        try:
+            shutil.copy2(ha_src, os.path.join(sc_root, 'sos_commands', 'pacemaker', 'ha.txt'))
+        except Exception:
+            pass
+
+    # Updates / zypper
+    updates_src = sc_find_file(sc_root, 'updates.txt')
+    if updates_src:
+        os.makedirs(os.path.join(sc_root, 'sos_commands', 'dnf'), exist_ok=True)
+        # Extract zypper patches info
+        zypper_patches = sc_extract_section(updates_src, '/usr/bin/zypper')
+        if zypper_patches:
+            _write('sos_commands/dnf/zypper_patches', zypper_patches)
+
+    # last reboot
+    last_out = sc_read_file(sc_root, 'last_reboot')
+    if last_out:
+        _write('sos_commands/general/last_reboot', last_out)
+        _write('last', last_out)
+
+
+def detect_hostname(sosreport_path: str, archive_format: str = 'sosreport') -> str:
+    """Detect hostname from sosreport or supportconfig"""
+    # Supportconfig: parse from basic-environment.txt
+    if archive_format == 'supportconfig':
+        sc_hostname = sc_read_file(sosreport_path, 'hostname')
+        if sc_hostname:
+            return sc_hostname.strip().splitlines()[0].strip()
+        # Try directory name pattern (nts_hostname_YYMMDD)
+        dirname = os.path.basename(sosreport_path)
+        if dirname.startswith(('nts_', 'scc_')):
+            parts = dirname.split('_')
+            if len(parts) >= 2:
+                return parts[1]
+    
     hostname_files = [
         os.path.join(sosreport_path, "etc", "hostname"),
         os.path.join(sosreport_path, "hostname"),
@@ -560,8 +1015,15 @@ def detect_hostname(sosreport_path: str) -> str:
     return "unknown"
 
 
-def detect_uptime(sosreport_path: str) -> str:
-    """Detect uptime from sosreport"""
+def detect_uptime(sosreport_path: str, archive_format: str = 'sosreport') -> str:
+    """Detect uptime from sosreport or supportconfig"""
+    if archive_format == 'supportconfig':
+        sc_uptime = sc_read_file(sosreport_path, 'uptime')
+        if sc_uptime:
+            for line in sc_uptime.splitlines():
+                if 'load average' in line or 'up' in line:
+                    return line.strip()
+    
     uptime_files = [
         os.path.join(sosreport_path, "uptime"),
         os.path.join(sosreport_path, "sos_commands", "general", "uptime"),
@@ -581,7 +1043,7 @@ def detect_uptime(sosreport_path: str) -> str:
     return "N/A"
 
 
-def detect_kernel_cmdline(sosreport_path: str) -> dict:
+def detect_kernel_cmdline(sosreport_path: str, archive_format: str = 'sosreport') -> dict:
     """Read /proc/cmdline — the kernel boot parameters for the running kernel.
     
     Returns dict with:
@@ -594,6 +1056,16 @@ def detect_kernel_cmdline(sosreport_path: str) -> dict:
         os.path.join(sosreport_path, "proc", "cmdline"),
         os.path.join(sosreport_path, "sos_commands", "kernel", "cat_.proc.cmdline"),
     ]
+    
+    # Supportconfig: /proc/cmdline is embedded in boot.txt
+    if archive_format == 'supportconfig':
+        sc_cmdline = sc_read_file(sosreport_path, 'cmdline')
+        if sc_cmdline:
+            # Write to temp path so the rest of the function works
+            raw = sc_cmdline.strip().splitlines()[0].strip() if sc_cmdline.strip() else ''
+            if raw:
+                cmdline_paths = []  # skip file search
+                # Fall through to parsing below with raw already set
     
     raw = ''
     for p in cmdline_paths:
@@ -648,7 +1120,7 @@ def detect_kernel_cmdline(sosreport_path: str) -> dict:
     }
 
 
-def detect_sysctl_tuning(sosreport_path: str) -> dict:
+def detect_sysctl_tuning(sosreport_path: str, archive_format: str = 'sosreport') -> dict:
     """Extract performance-relevant sysctl parameters from sos_commands/kernel/sysctl_-a.
 
     Returns dict with categorized key parameters that impact performance tuning,
@@ -661,6 +1133,19 @@ def detect_sysctl_tuning(sosreport_path: str) -> dict:
         os.path.join(sosreport_path, "sos_commands", "kernel", "sysctl"),
         os.path.join(sosreport_path, "proc", "sys"),  # fallback — individual files
     ]
+
+    # Supportconfig: sysctl -a output is in env.txt
+    if archive_format == 'supportconfig':
+        sc_sysctl = sc_read_file(sosreport_path, 'sysctl')
+        if sc_sysctl:
+            # Write to temp file so the existing parsing logic works
+            _tmp_sysctl = os.path.join(sosreport_path, '_sysctl_tmp.txt')
+            try:
+                with open(_tmp_sysctl, 'w') as f:
+                    f.write(sc_sysctl)
+                sysctl_files.insert(0, _tmp_sysctl)
+            except Exception:
+                pass
 
     # Key parameters to extract, grouped for display
     WANTED = {
@@ -766,7 +1251,7 @@ def detect_sysctl_tuning(sosreport_path: str) -> dict:
     }
 
 
-def detect_reboot_history(sosreport_path: str, report_year: int = None) -> list:
+def detect_reboot_history(sosreport_path: str, report_year: int = None, archive_format: str = 'sosreport') -> list:
     """Detect reboot timestamps by grepping BOOT_IMAGE from messages/dmesg files.
     
     Each BOOT_IMAGE line in /var/log/messages marks a kernel boot, so it shows
@@ -873,8 +1358,15 @@ def detect_reboot_history(sosreport_path: str, report_year: int = None) -> list:
     return reboots
 
 
-def detect_date(sosreport_path: str) -> str:
-    """Detect date command output from sosreport"""
+def detect_date(sosreport_path: str, archive_format: str = 'sosreport') -> str:
+    """Detect date command output from sosreport or supportconfig"""
+    if archive_format == 'supportconfig':
+        sc_date = sc_read_file(sosreport_path, 'date')
+        if sc_date:
+            first_line = sc_date.strip().splitlines()[0].strip()
+            if first_line and not first_line.startswith('Local time:'):
+                return first_line
+    
     # Priority order - check sos_commands/date/date first
     date_files = [
         os.path.join(sosreport_path, "sos_commands", "date", "date"),
@@ -911,13 +1403,26 @@ def extract_year_from_date(date_str: str) -> Optional[int]:
     return None
 
 
-def detect_os_release(sosreport_path: str) -> str:
-    """Detect OS release version from sosreport"""
+def detect_os_release(sosreport_path: str, archive_format: str = 'sosreport') -> str:
+    """Detect OS release version from sosreport or supportconfig"""
+    if archive_format == 'supportconfig':
+        # Try /etc/os-release first
+        sc_os = sc_read_file(sosreport_path, 'os_release')
+        if sc_os:
+            for line in sc_os.splitlines():
+                if line.startswith('PRETTY_NAME='):
+                    return line.split('=', 1)[1].strip('"\'')
+        # Try /etc/SuSE-release
+        sc_suse = sc_read_file(sosreport_path, 'suse_release')
+        if sc_suse:
+            return sc_suse.strip().splitlines()[0].strip()
+    
     release_files = [
         os.path.join(sosreport_path, "etc", "redhat-release"),
         os.path.join(sosreport_path, "etc", "system-release"),
         os.path.join(sosreport_path, "etc", "os-release"),
         os.path.join(sosreport_path, "etc", "oracle-release"),
+        os.path.join(sosreport_path, "etc", "SuSE-release"),
             ]
     
     for rf in release_files:
@@ -1041,7 +1546,7 @@ OS_FLAVOR_CONFIG = {
 OS_FLAVOR_CONFIG['unknown'] = OS_FLAVOR_CONFIG['rhel']
 
 
-def detect_cpu_info(sosreport_path: str) -> dict:
+def detect_cpu_info(sosreport_path: str, archive_format: str = 'sosreport') -> dict:
     """Detect CPU information from sosreport (like xsos)"""
     cpu_info = {
         'model': 'N/A',
@@ -1114,7 +1619,7 @@ def detect_cpu_info(sosreport_path: str) -> dict:
     return cpu_info
 
 
-def detect_memory_info(sosreport_path: str) -> dict:
+def detect_memory_info(sosreport_path: str, archive_format: str = 'sosreport') -> dict:
     """Detect memory information from sosreport (like xsos)"""
     mem_info = {
         'total_gb': 'N/A',
@@ -1246,7 +1751,7 @@ def detect_memory_info(sosreport_path: str) -> dict:
     return mem_info
 
 
-def detect_kernel_version(sosreport_path: str) -> str:
+def detect_kernel_version(sosreport_path: str, archive_format: str = 'sosreport') -> str:
     """Detect kernel version from sosreport"""
     uname_files = [
         os.path.join(sosreport_path, "sos_commands", "kernel", "uname_-a"),
@@ -1270,7 +1775,7 @@ def detect_kernel_version(sosreport_path: str) -> str:
     return "N/A"
 
 
-def detect_df_info(sosreport_path: str) -> List[dict]:
+def detect_df_info(sosreport_path: str, archive_format: str = 'sosreport') -> List[dict]:
     """Detect filesystem disk usage from sosreport"""
     df_info = []
     
@@ -1341,7 +1846,7 @@ def detect_df_info(sosreport_path: str) -> List[dict]:
     return df_info
 
 
-def detect_installed_packages(sosreport_path: str) -> dict:
+def detect_installed_packages(sosreport_path: str, archive_format: str = 'sosreport') -> dict:
     """Detect important installed packages from sosreport"""
     packages = {
         'rhui': [],
@@ -1401,8 +1906,20 @@ def detect_installed_packages(sosreport_path: str) -> dict:
     return packages
 
 
-def detect_selinux_status(sosreport_path: str) -> str:
-    """Detect SELinux status from sosreport"""
+def detect_selinux_status(sosreport_path: str, archive_format: str = 'sosreport') -> str:
+    """Detect SELinux or AppArmor status from sosreport/supportconfig"""
+    # For SUSE — check AppArmor instead of SELinux
+    apparmor_file = os.path.join(sosreport_path, 'sos_commands', 'apparmor', 'apparmor_status')
+    if os.path.isfile(apparmor_file):
+        try:
+            with open(apparmor_file, 'r', errors='ignore') as f:
+                content = f.read()
+                if 'profiles are loaded' in content or 'profiles are in' in content:
+                    return f"AppArmor (active)"
+                return "AppArmor (unknown state)"
+        except Exception:
+            pass
+    
     selinux_files = [
         os.path.join(sosreport_path, "sos_commands", "selinux", "sestatus_-b"),
         os.path.join(sosreport_path, "sos_commands", "selinux", "sestatus"),
@@ -1421,7 +1938,7 @@ def detect_selinux_status(sosreport_path: str) -> str:
     return "N/A"
 
 
-def detect_kdump_status(sosreport_path: str) -> dict:
+def detect_kdump_status(sosreport_path: str, archive_format: str = 'sosreport') -> dict:
     """Detect kdump status and crash dump files from sosreport
     
     Checks:
@@ -1545,7 +2062,7 @@ def detect_kdump_status(sosreport_path: str) -> dict:
     return kdump
 
 
-def detect_top_processes(sosreport_path: str) -> dict:
+def detect_top_processes(sosreport_path: str, archive_format: str = 'sosreport') -> dict:
     """Detect top CPU and memory consuming processes from sosreport ps output"""
     top_processes = {
         'top_cpu': [],
@@ -1642,7 +2159,7 @@ def detect_top_processes(sosreport_path: str) -> dict:
 # V7 NEW DETECTION FUNCTIONS
 # ============================================================================
 
-def detect_cloud_provider(sosreport_path: str) -> dict:
+def detect_cloud_provider(sosreport_path: str, archive_format: str = 'sosreport') -> dict:
     """Auto-detect cloud provider (Azure/AWS/GCP/Oracle) and collect provider-specific metadata.
     
     Detection order:
@@ -1925,7 +2442,7 @@ def detect_cloud_provider(sosreport_path: str) -> dict:
     return cloud_info
 
 
-def detect_azure_metadata(sosreport_path: str) -> dict:
+def detect_azure_metadata(sosreport_path: str, archive_format: str = 'sosreport') -> dict:
     """Directly find and parse Azure instance_metadata.json from sosreport.
     
     Searches ALL directories under sos_commands/ for any JSON file with a
@@ -2042,7 +2559,7 @@ def detect_azure_metadata(sosreport_path: str) -> dict:
     return result
 
 
-def detect_crash_dumps(sosreport_path: str) -> dict:
+def detect_crash_dumps(sosreport_path: str, archive_format: str = 'sosreport') -> dict:
     """Discover crash dump directories and extract vmcore-dmesg content.
     
     Goes deeper than detect_kdump_status() — actually reads vmcore-dmesg.txt
@@ -2137,7 +2654,7 @@ def detect_crash_dumps(sosreport_path: str) -> dict:
     return crash_info
 
 
-def detect_network_config(sosreport_path: str) -> dict:
+def detect_network_config(sosreport_path: str, archive_format: str = 'sosreport') -> dict:
     """Collect detailed network configuration from sosreport.
     
     Covers: interfaces (ip addr), routing, DNS (resolv.conf), firewall,
@@ -2246,7 +2763,7 @@ def detect_network_config(sosreport_path: str) -> dict:
     return net_info
 
 
-def detect_cve_advisories(sosreport_path: str) -> dict:
+def detect_cve_advisories(sosreport_path: str, archive_format: str = 'sosreport') -> dict:
     """Extract CVE information from DNF/YUM security advisories.
     
     Parses sos_commands/dnf/dnf_updateinfo* and sos_commands/yum/yum_updateinfo*
@@ -3531,7 +4048,7 @@ def generate_copy_paste_summary(hostname: str, system_info: dict, sar_anomalies:
                 lines.append(f"    {label + ':':<15} {count:,}")
     lines.append("")
     lines.append("=" * 70)
-    lines.append(f"  Generated by SOSreport Analyzer V7")
+    lines.append(f"  Generated by SOSreport & Supportconfig Analyzer V7.2")
     lines.append("=" * 70)
     
     return '\n'.join(lines)
@@ -3847,30 +4364,32 @@ def group_correlations(enriched: list) -> list:
     return result
 
 
-def get_system_info(sosreport_path: str) -> dict:
-    """Get all system information from sosreport (like xsos)"""
+def get_system_info(sosreport_path: str, archive_format: str = 'sosreport') -> dict:
+    """Get all system information from sosreport or supportconfig (like xsos)"""
+    _af = archive_format
     return {
-        'hostname': detect_hostname(sosreport_path),
-        'uptime': detect_uptime(sosreport_path),
-        'date': detect_date(sosreport_path),
-        'os_release': detect_os_release(sosreport_path),
-        'kernel': detect_kernel_version(sosreport_path),
-        'cpu_info': detect_cpu_info(sosreport_path),
-        'memory_info': detect_memory_info(sosreport_path),
-        'df_info': detect_df_info(sosreport_path),
-        'packages': detect_installed_packages(sosreport_path),
-        'selinux': detect_selinux_status(sosreport_path),
-        'top_processes': detect_top_processes(sosreport_path),
-        'kdump': detect_kdump_status(sosreport_path),
+        'hostname': detect_hostname(sosreport_path, _af),
+        'uptime': detect_uptime(sosreport_path, _af),
+        'date': detect_date(sosreport_path, _af),
+        'os_release': detect_os_release(sosreport_path, _af),
+        'kernel': detect_kernel_version(sosreport_path, _af),
+        'cpu_info': detect_cpu_info(sosreport_path, _af),
+        'memory_info': detect_memory_info(sosreport_path, _af),
+        'df_info': detect_df_info(sosreport_path, _af),
+        'packages': detect_installed_packages(sosreport_path, _af),
+        'selinux': detect_selinux_status(sosreport_path, _af),
+        'top_processes': detect_top_processes(sosreport_path, _af),
+        'kdump': detect_kdump_status(sosreport_path, _af),
         # V7 additions
-        'cloud': detect_cloud_provider(sosreport_path),
-        'azure_metadata': detect_azure_metadata(sosreport_path),
-        'crash_dumps': detect_crash_dumps(sosreport_path),
-        'network_config': detect_network_config(sosreport_path),
-        'cve_advisories': detect_cve_advisories(sosreport_path),
-        'reboot_history': detect_reboot_history(sosreport_path),
-        'kernel_cmdline': detect_kernel_cmdline(sosreport_path),
-        'sysctl': detect_sysctl_tuning(sosreport_path),
+        'cloud': detect_cloud_provider(sosreport_path, _af),
+        'azure_metadata': detect_azure_metadata(sosreport_path, _af),
+        'crash_dumps': detect_crash_dumps(sosreport_path, _af),
+        'network_config': detect_network_config(sosreport_path, _af),
+        'cve_advisories': detect_cve_advisories(sosreport_path, _af),
+        'reboot_history': detect_reboot_history(sosreport_path, archive_format=_af),
+        'kernel_cmdline': detect_kernel_cmdline(sosreport_path, _af),
+        'sysctl': detect_sysctl_tuning(sosreport_path, _af),
+        '_archive_format': archive_format,
     }
 
 
@@ -7211,7 +7730,7 @@ def main():
         if cleaned > 0:
             logging.info(f"Startup: cleaned {cleaned} stale temp dirs")
     
-    st.markdown('<h1 class="main-header">📊 SOSreport Analyzer V7</h1>', unsafe_allow_html=True)
+    st.markdown('<h1 class="main-header">📊 SOSreport & Supportconfig Analyzer V7.2</h1>', unsafe_allow_html=True)
     st.markdown("---")
     
     # Sidebar
@@ -7299,7 +7818,7 @@ def main():
         st.markdown("---")
         st.markdown("### 📖 Instructions")
         st.markdown("""
-        1. Upload a SOSreport file (.tar.xz, .tar.gz)
+        1. Upload a SOSreport (.tar.xz, .tar.gz) or SUSE Supportconfig archive
         2. Wait for extraction and parsing
         3. Review the analysis summary
         4. Push data to InfluxDB/Loki
@@ -7360,11 +7879,11 @@ def main():
     col1, col2 = st.columns([2, 1])
     
     with col1:
-        st.header("📁 Upload SOSreport")
+        st.header("📁 Upload SOSreport / Supportconfig")
         uploaded_file = st.file_uploader(
             "Choose a SOSreport file",
-            type=['tar.xz', 'tar.gz', 'tgz', 'tar.bz2', 'tar'],
-            help="Upload a compressed SOSreport file"
+            type=['tar.xz', 'tar.gz', 'tgz', 'tar.bz2', 'tar', 'txz'],
+            help="Upload a compressed SOSreport or SUSE Supportconfig archive"
         )
     
     with col2:
@@ -7423,20 +7942,24 @@ def main():
                 
                 # Show file info
                 file_size_mb = uploaded_file.size / (1024 * 1024)
-                st.info(f"📁 File: {uploaded_file.name} ({file_size_mb:.1f} MB)")
                 
                 # Extract with concurrency control
                 with _active_sessions_lock:
                     if _sid in _active_sessions:
                         _active_sessions[_sid]['phase'] = 'extracting'
-                status_text.text("📦 Extracting SOSreport...")
+                status_text.text("📦 Extracting archive...")
                 _t0 = _time.time()
                 temp_dir, sosreport_path = extract_sosreport(uploaded_file, progress_bar, status_text)
                 _timings['Extraction'] = _time.time() - _t0
                 
+                # Detect archive format (sosreport vs supportconfig)
+                archive_format = detect_archive_format(sosreport_path)
+                _format_label = "Supportconfig (SUSE)" if archive_format == 'supportconfig' else "SOSreport"
+                st.info(f"📁 File: {uploaded_file.name} ({file_size_mb:.1f} MB) — Detected format: **{_format_label}**")
+                
                 # Detect system info
                 _t0 = _time.time()
-                system_info = get_system_info(sosreport_path)
+                system_info = get_system_info(sosreport_path, archive_format)
                 hostname = system_info['hostname']
                 st.session_state['last_hostname'] = hostname  # For data privacy purge
                 with _active_sessions_lock:
@@ -7766,10 +8289,11 @@ from(bucket: "{INFLUXDB_BUCKET}")
                     'timings': dict(_timings),
                     'total_time': _total_time,
                     'file_size_mb': file_size_mb,
+                    'archive_format': archive_format,
                 }
                 
             except Exception as e:
-                st.error(f"❌ Error processing SOSreport: {str(e)}")
+                st.error(f"❌ Error processing archive: {str(e)}")
             
             finally:
                 # Unregister this session from active tracking
@@ -7817,7 +8341,9 @@ from(bucket: "{INFLUXDB_BUCKET}")
             
             # Display summary
             st.markdown("---")
-            st.header(" Analysis Summary")
+            _archive_format = _ad.get('archive_format', 'sosreport')
+            _fmt_badge = "🟢 Supportconfig (SUSE)" if _archive_format == 'supportconfig' else "🔵 SOSreport"
+            st.header(f" Analysis Summary — {_fmt_badge}")
 
             # ============= BASIC SYSTEM INFO (like xsos) =============
             st.subheader(" Basic System Information")
@@ -8887,7 +9413,7 @@ from(bucket: "{INFLUXDB_BUCKET}")
     st.markdown("---")
     st.markdown(
         "<div style='text-align: center; color: gray;'>"
-        "SOSreport Analyzer V7 | Powered by Streamlit, InfluxDB, Loki & Grafana | System Info + Anomaly Detection + Critical Events + Patch Compliance + Cloud Detection"
+        "SOSreport & Supportconfig Analyzer V7.2 | Powered by Streamlit, InfluxDB, Loki & Grafana | System Info + Anomaly Detection + Critical Events + Patch Compliance + Cloud Detection"
         "</div>",
         unsafe_allow_html=True
     )
