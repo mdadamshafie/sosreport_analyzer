@@ -2991,14 +2991,80 @@ def run_system_health_checks(sosreport_path: str, system_info: dict,
             add("General Errors", "System Service Analysis", "info", "No service failures in logs")
 
     # ── Network ───────────────────────────────────────────────────────
-    # DHCP failures
-    dhcp_fail_re = re.compile(r'(dhclient|dhcp|DHCPDISCOVER|DHCPREQUEST).*(fail|error|timeout|no.?lease|declined)', re.I)
-    dhcp_fails = dhcp_fail_re.findall(all_boot)
-    if dhcp_fails:
-        add("Network", "DHCP failures detected in system logs", "critical",
-            f"{len(dhcp_fails)} DHCP failure(s) — network may not have configured correctly")
+
+    # 1. DHCP request/lease failures (Linux.network.dhcp_failures)
+    #    Inspects: var/log/syslog, var/log/messages
+    _dhcp_failure_patterns = [
+        re.compile(r'No DHCPOFFERS received', re.I),
+        re.compile(r'No working leases in persistent database\s*-\s*sleeping', re.I),
+        re.compile(r'DHCPREQUEST[^"\n]*no answer', re.I),
+        re.compile(r'DHCPDISCOVER[^"\n]*no answer', re.I),
+        re.compile(r'Failed to (?:acquire|obtain) DHCP (?:lease|address)', re.I),
+        re.compile(r'DHCPv4.*timed out', re.I),
+        re.compile(r'dhclient:.*timed out waiting for a valid offer', re.I),
+    ]
+    # Read the exact files specified in the signature
+    _dhcp_log_content = ""
+    for _dhcp_log in ['var/log/syslog', 'var/log/messages']:
+        _dhcp_log_content += _read(os.path.join(sosreport_path, _dhcp_log))
+    _dhcp_hits = []
+    for _pat in _dhcp_failure_patterns:
+        _dhcp_hits.extend(_pat.findall(_dhcp_log_content))
+    if _dhcp_hits:
+        _recommendations = (
+            "Verify NIC/subnet allows DHCP and no NSG/firewall blocks UDP 67/68; "
+            "Check DHCP server/relay availability; renew with 'dhclient -v'; "
+            "Ensure predictable interface naming and correct MAC/NIC mapping; "
+            "Review systemd-networkd/NetworkManager status and journal logs; "
+            "As workaround, assign a temporary static IP for troubleshooting"
+        )
+        add("Network", "DHCP request/lease failures detected", "critical",
+            f"{len(_dhcp_hits)} DHCP negotiation failure(s) — VM may not receive IP. {_recommendations}")
     else:
-        add("Network", "DHCP failures detected in system logs", "info", "No DHCP failures")
+        add("Network", "DHCP request/lease failures detected", "info",
+            "No DHCP negotiation failures found in syslog/messages")
+
+    # 2. Network DHCP Configuration Check (Linux.network.dhcp)
+    #    Inspects: netplan, ifcfg-*, /etc/network/interfaces
+    _dhcp_config_issues = []
+
+    # Check netplan (Ubuntu/cloud-init)
+    _netplan_dir = os.path.join(sosreport_path, 'etc', 'netplan')
+    if os.path.isdir(_netplan_dir):
+        for _np_fn in os.listdir(_netplan_dir):
+            _np_content = _read(os.path.join(_netplan_dir, _np_fn))
+            if re.search(r'dhcp4:\s*false', _np_content, re.I):
+                _dhcp_config_issues.append(f"Netplan {_np_fn}: dhcp4 is disabled (static IP)")
+
+    # Check ifcfg (RHEL/CentOS/Oracle Linux)
+    _ifcfg_dir = os.path.join(sosreport_path, 'etc', 'sysconfig', 'network-scripts')
+    if os.path.isdir(_ifcfg_dir):
+        for _ifcfg_fn in os.listdir(_ifcfg_dir):
+            if _ifcfg_fn.startswith('ifcfg-') and _ifcfg_fn != 'ifcfg-lo':
+                _ifcfg_content = _read(os.path.join(_ifcfg_dir, _ifcfg_fn))
+                if re.search(r'BOOTPROTO\s*=\s*["\']?static', _ifcfg_content, re.I):
+                    _dhcp_config_issues.append(f"{_ifcfg_fn}: BOOTPROTO=static (not DHCP)")
+
+    # Check /etc/network/interfaces (Debian/Ubuntu classic)
+    _eni_content = _read(os.path.join(sosreport_path, 'etc', 'network', 'interfaces'))
+    if re.search(r'iface\s+\S+\s+inet\s+static', _eni_content, re.I):
+        _static_ifaces = re.findall(r'iface\s+(\S+)\s+inet\s+static', _eni_content, re.I)
+        for _si in _static_ifaces:
+            _dhcp_config_issues.append(f"/etc/network/interfaces: {_si} configured as static")
+
+    if _dhcp_config_issues:
+        _dhcp_reco = (
+            "For Azure VMs, DHCP is recommended for network interfaces; "
+            "If using static IP, ensure it matches Azure portal config; "
+            "Check cloud-init network configuration is enabled; "
+            "Verify network interface is detected and network service is running"
+        )
+        add("Network", "Network DHCP Configuration Check", "warning",
+            f"{len(_dhcp_config_issues)} interface(s) not using DHCP: "
+            + '; '.join(_dhcp_config_issues) + f". {_dhcp_reco}")
+    else:
+        add("Network", "Network DHCP Configuration Check", "info",
+            "All detected interfaces are using DHCP (recommended for Azure VMs)")
 
     # ── Pacemaker ──────────────────────────────────────────────────────
     pcs_dir = os.path.join(sosreport_path, 'sos_commands', 'pacemaker')
