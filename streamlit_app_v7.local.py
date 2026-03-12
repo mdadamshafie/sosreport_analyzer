@@ -2689,11 +2689,538 @@ def detect_patch_compliance(sosreport_path: str, packages_info: dict, kernel_ver
     return compliance
 
 
+# ═══════════════════════════════════════════════════════════════════════
+#  SYSTEM HEALTH CHECKS — Categorized findings (V7.1)
+#  Modeled after colleague's tool: Azure Extensions, Serial Console,
+#  Filesystem, General Errors, Network, Pacemaker, Performance,
+#  Repository Errors, SLES, System Config, Results
+# ═══════════════════════════════════════════════════════════════════════
+
+def run_system_health_checks(sosreport_path: str, system_info: dict,
+                             critical_events: list = None,
+                             patch_compliance: dict = None) -> dict:
+    """Run comprehensive system health checks and return categorized findings.
+    
+    Returns dict of:
+      { category_name: [ {name, severity, details}, ... ] }
+    Severities: 'critical', 'warning', 'info'
+    """
+    findings = {}
+
+    def add(category: str, name: str, severity: str, details: str = ""):
+        findings.setdefault(category, []).append({
+            'name': name, 'severity': severity, 'details': details,
+        })
+
+    cloud = system_info.get('cloud', {})
+    cloud_details = cloud.get('details', {})
+    is_azure = cloud.get('provider') == 'azure'
+
+    # Helper: safe file reader
+    def _read(path, tail=0):
+        try:
+            if os.path.isfile(path):
+                with open(path, 'r', errors='ignore') as f:
+                    if tail:
+                        lines = f.readlines()
+                        return ''.join(lines[-tail:])
+                    return f.read()
+        except Exception:
+            pass
+        return ""
+
+    # ── Azure Extensions ──────────────────────────────────────────────
+    if is_azure:
+        waagent_log = _read(os.path.join(sosreport_path, 'var', 'log', 'waagent.log'))
+        waagent_log_tail = cloud_details.get('waagent_log_tail', '') or waagent_log[-80_000:] if waagent_log else ''
+
+        # 1. Automatic Guest patching errors
+        patch_err_pats = [
+            re.compile(r'(auto.?update|patch).*(fail|error|exception)', re.I),
+            re.compile(r'PatchInstall.*(fail|error)', re.I),
+        ]
+        patch_errs = [l for l in waagent_log_tail.splitlines() if any(p.search(l) for p in patch_err_pats)]
+        if patch_errs:
+            add("Azure Extensions", "Automatic Guest patching errors", "warning",
+                f"{len(patch_errs)} patching error(s) in waagent.log")
+        else:
+            add("Azure Extensions", "Automatic Guest patching errors", "info", "No patching errors found")
+
+        # 2. VM Extension Failure
+        ext_fail_re = re.compile(r'extension.*(fail|error|not\s+ready)', re.I)
+        ext_fails = [l for l in waagent_log_tail.splitlines() if ext_fail_re.search(l)]
+        if ext_fails:
+            add("Azure Extensions", "VM Extension Failure", "critical" if len(ext_fails) > 5 else "info",
+                f"{len(ext_fails)} extension error(s) detected")
+        else:
+            add("Azure Extensions", "VM Extension Failure", "info", "No extension failures")
+
+        # 3. Azure Extension Timeout Errors
+        timeout_re = re.compile(r'(extension|handler).*(timeout|timed?\s*out)', re.I)
+        timeouts = [l for l in waagent_log_tail.splitlines() if timeout_re.search(l)]
+        if timeouts:
+            add("Azure Extensions", "Azure Extension Timeout Errors", "critical",
+                f"{len(timeouts)} timeout(s) detected")
+        else:
+            add("Azure Extensions", "Azure Extension Timeout Errors", "info", "No timeout errors")
+
+        # 4. OVF Environment Missing (Specialized Disk)
+        ovf_env = cloud_details.get('ovf_env', '')
+        ovf_path = os.path.join(sosreport_path, 'var', 'lib', 'waagent', 'ovf-env.xml')
+        if not ovf_env and not os.path.isfile(ovf_path):
+            add("Azure Extensions", "OVF Environment Missing (Specialized Disk)", "critical",
+                "ovf-env.xml not found — VM may be from a specialized disk")
+        else:
+            add("Azure Extensions", "OVF Environment Missing (Specialized Disk)", "info",
+                "ovf-env.xml present")
+
+        # 5. Agent Extension Handler Launch Failure
+        handler_fail_re = re.compile(r'(handler|ExtHandler).*(launch|start).*(fail|error|exception)', re.I)
+        handler_fails = [l for l in waagent_log_tail.splitlines() if handler_fail_re.search(l)]
+        if handler_fails:
+            add("Azure Extensions", "Agent Extension Handler Launch Failure", "critical",
+                f"{len(handler_fails)} handler launch failure(s)")
+        else:
+            add("Azure Extensions", "Agent Extension Handler Launch Failure", "info",
+                "No handler launch failures")
+
+        # 6. WALinuxAgent Python Missing Module
+        py_missing_re = re.compile(r'(ImportError|ModuleNotFoundError|No module named)', re.I)
+        py_errs = [l for l in waagent_log_tail.splitlines() if py_missing_re.search(l)]
+        if py_errs:
+            add("Azure Extensions", "WALinuxAgent Python Missing Module", "info",
+                f"{len(py_errs)} Python import error(s) in waagent.log")
+        else:
+            add("Azure Extensions", "WALinuxAgent Python Missing Module", "info",
+                "No Python module errors")
+
+        # 7. Wireserver Connectivity
+        wire_re = re.compile(r'(wire\s*server|168\.63\.129\.16).*(fail|error|timeout|unreachable|refused)', re.I)
+        wire_errs = [l for l in waagent_log_tail.splitlines() if wire_re.search(l)]
+        if wire_errs:
+            add("Azure Extensions", "Wireserver Connectivity", "critical",
+                f"{len(wire_errs)} wireserver connectivity issue(s)")
+        else:
+            add("Azure Extensions", "Wireserver Connectivity", "info", "No wireserver issues")
+
+    # ── Serial Console / Boot ─────────────────────────────────────────
+    # Check dmesg, journal, boot.log, messages for boot problems
+    boot_sources = []
+    for src in ['var/log/boot.log', 'var/log/messages']:
+        content = _read(os.path.join(sosreport_path, src))
+        if content:
+            boot_sources.append(content)
+    # dmesg
+    for dpath in ['sos_commands/kernel/dmesg', 'var/log/dmesg']:
+        content = _read(os.path.join(sosreport_path, dpath))
+        if content:
+            boot_sources.append(content)
+            break
+    # journal
+    jdir = os.path.join(sosreport_path, 'sos_commands', 'logs')
+    if os.path.isdir(jdir):
+        for fn in os.listdir(jdir):
+            if 'journalctl' in fn and not fn.endswith('.gz'):
+                content = _read(os.path.join(jdir, fn))
+                if content:
+                    boot_sources.append(content[:500_000])
+                    break
+    all_boot = '\n'.join(boot_sources)
+
+    # 1. Dracut Initqueue Timeout
+    dracut_timeout_re = re.compile(r'dracut.*(initqueue|timeout).*?(could\s*not\s*boot|timeout|Warning)', re.I)
+    if dracut_timeout_re.search(all_boot):
+        add("Serial Console", "Dracut Initqueue Timeout - Could Not Boot", "critical",
+            "dracut initqueue timeout detected — system may have failed to boot")
+    
+    # 2. Dracut Warning Would Not Boot
+    dracut_warn_re = re.compile(r'dracut.*Warning.*(?:not boot|unable|fail)', re.I)
+    if dracut_warn_re.search(all_boot):
+        add("Serial Console", "Dracut Warning Would Not Boot", "critical",
+            "dracut warning: system may not have booted correctly")
+
+    # 3. Emergency Mode
+    emergency_re = re.compile(r'(Entering emergency mode|emergency\.target|emergency\.service.*start)', re.I)
+    if emergency_re.search(all_boot):
+        add("Serial Console", "Emergency Mode", "critical",
+            "System entered emergency mode")
+
+    # 4. Unable To Boot Grub Rescue Error
+    grub_re = re.compile(r'(grub\s*rescue|error:\s*no such (device|partition)|GRUB.*error)', re.I)
+    if grub_re.search(all_boot):
+        add("Serial Console", "Unable To Boot Grub Rescue Error", "critical",
+            "GRUB rescue/boot error detected")
+
+    # 5. Kernel NULL Pointer Dereference
+    nullptr_re = re.compile(r'BUG:\s*kernel\s*NULL\s*pointer\s*dereference', re.I)
+    if nullptr_re.search(all_boot):
+        add("Serial Console", "Kernel NULL Pointer Dereference", "critical",
+            "Kernel NULL pointer dereference detected")
+
+    # 6. Kernel Panic
+    kpanic_re = re.compile(r'Kernel\s*panic\s*-\s*not\s*syncing', re.I)
+    if kpanic_re.search(all_boot):
+        add("Serial Console", "Kernel Panic Detected", "critical",
+            "Kernel panic detected in logs")
+
+    # 7. Kernel Softlockup / Hung Tasks
+    hung_re = re.compile(r'(soft\s*lockup|hung_task_timeout|task\s+\S+\s+blocked\s+for\s+more\s+than)', re.I)
+    if hung_re.search(all_boot):
+        add("Serial Console", "Kernel Softlockup - Hung Tasks", "critical",
+            "Kernel soft lockup or hung task detected")
+
+    # If nothing found, mark section clean
+    if "Serial Console" not in findings:
+        add("Serial Console", "No boot issues detected", "info", "All boot checks passed")
+
+    # ── Filesystem ────────────────────────────────────────────────────
+    # 1. Mount failures during boot
+    mount_fail_re = re.compile(r'(mount|systemd).*(?:fail|error|unable).*mount', re.I)
+    mount_fails = mount_fail_re.findall(all_boot)
+    if mount_fails:
+        add("Filesystem", "Mount failures detected during boot", "critical",
+            f"{len(mount_fails)} mount failure(s) found in boot/system logs")
+
+    # 2. NFSv3 fstab mounts conflict with cloud-init
+    fstab_content = _read(os.path.join(sosreport_path, 'etc', 'fstab'))
+    nfs_fstab = [l for l in fstab_content.splitlines()
+                 if l.strip() and not l.strip().startswith('#') and 'nfs' in l.lower()]
+    cloud_init_cfg = _read(os.path.join(sosreport_path, 'etc', 'cloud', 'cloud.cfg'))
+    if nfs_fstab and ('mounts' in cloud_init_cfg or 'mount' in cloud_init_cfg.lower()):
+        add("Filesystem", "NFSv3 fstab mounts conflict with cloud-init", "critical",
+            f"{len(nfs_fstab)} NFS mount(s) in fstab; cloud-init also manages mounts")
+    elif nfs_fstab:
+        add("Filesystem", "NFSv3 fstab mounts conflict with cloud-init", "info",
+            f"{len(nfs_fstab)} NFS mount(s) in fstab; no cloud-init conflict detected")
+
+    # 3. XFS filesystem issues
+    xfs_err_re = re.compile(r'(XFS.*error|xfs_force_shutdown|XFS.*corruption|xfs_log_force)', re.I)
+    xfs_errs = xfs_err_re.findall(all_boot)
+    if xfs_errs:
+        add("Filesystem", "XFS filesystem issues detection", "critical",
+            f"{len(xfs_errs)} XFS error(s) detected")
+
+    # ── General Errors ────────────────────────────────────────────────
+    # 1. Auto Power Off by Audit Daemon
+    audit_poweroff_re = re.compile(r'(audit.*power.?off|auditd.*halt|audit.*action.*halt|disk_full_action\s*=\s*halt)', re.I)
+    if audit_poweroff_re.search(all_boot):
+        add("General Errors", "Auto Power Off by Audit Daemon", "critical",
+            "System may have been powered off by audit daemon (disk full action = halt)")
+    else:
+        # Also check auditd.conf
+        auditd_conf = _read(os.path.join(sosreport_path, 'etc', 'audit', 'auditd.conf'))
+        if re.search(r'disk_full_action\s*=\s*(halt|HALT)', auditd_conf):
+            add("General Errors", "Auto Power Off by Audit Daemon", "critical",
+                "auditd.conf: disk_full_action = halt — auditd will shut down the system when disk is full")
+        elif re.search(r'disk_full_action\s*=\s*(suspend|SUSPEND)', auditd_conf):
+            add("General Errors", "Auto Power Off by Audit Daemon", "warning",
+                "auditd.conf: disk_full_action = suspend")
+
+    # 2. System Boot Analysis
+    boot_fail_re = re.compile(r'(Failed to start|Dependency failed|Job .* failed)', re.I)
+    boot_failures = boot_fail_re.findall(all_boot[:200_000])
+    if boot_failures:
+        add("General Errors", "System Boot Analysis", "critical",
+            f"{len(boot_failures)} service startup failure(s) during boot")
+    else:
+        add("General Errors", "System Boot Analysis", "info", "No boot startup failures detected")
+
+    # 3. Disk Space Exhaustion
+    df_info = system_info.get('df_info', [])
+    exhausted = [fs for fs in df_info if fs.get('use_percent', 0) >= 95]
+    high = [fs for fs in df_info if 90 <= fs.get('use_percent', 0) < 95]
+    if exhausted:
+        mounts = ', '.join(fs.get('mountpoint', '?') for fs in exhausted)
+        add("General Errors", "Disk Space Exhaustion", "critical",
+            f"Disk ≥95% full: {mounts}")
+    elif high:
+        mounts = ', '.join(fs.get('mountpoint', '?') for fs in high)
+        add("General Errors", "Disk Space Exhaustion", "warning",
+            f"Disk ≥90% full: {mounts}")
+
+    # 4. Filesystem Issues Analysis (from critical events)
+    if critical_events:
+        fs_events = [e for e in critical_events
+                     if e.get('category') == 'File System & Disk' and e.get('severity') == 'critical']
+        if fs_events:
+            add("General Errors", "Filesystem Issues Analysis", "critical",
+                f"{len(fs_events)} critical filesystem event(s) in logs")
+
+        # 5. Kernel Issues Analysis
+        kern_events = [e for e in critical_events
+                       if e.get('category') == 'CPU & Kernel Panic' and e.get('severity') == 'critical']
+        if kern_events:
+            add("General Errors", "Kernel Issues Analysis", "critical",
+                f"{len(kern_events)} critical kernel event(s)")
+
+        # 6. Network Connectivity Analysis
+        net_events = [e for e in critical_events if e.get('category') == 'Network Issues']
+        if net_events:
+            crit_net = [e for e in net_events if e.get('severity') == 'critical']
+            add("General Errors", "Network Connectivity Analysis",
+                "critical" if crit_net else "info",
+                f"{len(net_events)} network event(s), {len(crit_net)} critical")
+        else:
+            add("General Errors", "Network Connectivity Analysis", "info", "No network issues in logs")
+
+        # 7. Security Issues Analysis
+        sec_events = [e for e in critical_events if e.get('category') == 'Security & Antivirus']
+        if sec_events:
+            crit_sec = [e for e in sec_events if e.get('severity') == 'critical']
+            add("General Errors", "Security Issues Analysis",
+                "critical" if crit_sec else "info",
+                f"{len(sec_events)} security event(s), {len(crit_sec)} critical")
+        else:
+            add("General Errors", "Security Issues Analysis", "info", "No security issues in logs")
+
+        # 8. Segmentation Faults Analysis
+        segfault_re = re.compile(r'segfault|SIGSEGV|segmentation fault', re.I)
+        segfaults = [e for e in critical_events if segfault_re.search(e.get('message', ''))]
+        if segfaults:
+            add("General Errors", "Segmentation Faults Analysis", "info",
+                f"{len(segfaults)} segfault(s) detected")
+
+        # 9. System Service Analysis
+        svc_events = [e for e in critical_events if e.get('category') == 'Service & Systemd']
+        if svc_events:
+            crit_svc = [e for e in svc_events if e.get('severity') == 'critical']
+            add("General Errors", "System Service Analysis",
+                "critical" if crit_svc else "info",
+                f"{len(svc_events)} service event(s), {len(crit_svc)} critical")
+        else:
+            add("General Errors", "System Service Analysis", "info", "No service failures in logs")
+
+    # ── Network ───────────────────────────────────────────────────────
+    # DHCP failures
+    dhcp_fail_re = re.compile(r'(dhclient|dhcp|DHCPDISCOVER|DHCPREQUEST).*(fail|error|timeout|no.?lease|declined)', re.I)
+    dhcp_fails = dhcp_fail_re.findall(all_boot)
+    if dhcp_fails:
+        add("Network", "DHCP failures detected in system logs", "critical",
+            f"{len(dhcp_fails)} DHCP failure(s) — network may not have configured correctly")
+    else:
+        add("Network", "DHCP failures detected in system logs", "info", "No DHCP failures")
+
+    # ── Pacemaker ──────────────────────────────────────────────────────
+    pcs_dir = os.path.join(sosreport_path, 'sos_commands', 'pacemaker')
+    crm_dir = os.path.join(sosreport_path, 'sos_commands', 'cluster')
+    pcs_content = ""
+    for d in [pcs_dir, crm_dir]:
+        if os.path.isdir(d):
+            for fn in os.listdir(d):
+                pcs_content += _read(os.path.join(d, fn), tail=500)
+    corosync_log = _read(os.path.join(sosreport_path, 'var', 'log', 'cluster', 'corosync.log'), tail=500)
+    pacemaker_log = _read(os.path.join(sosreport_path, 'var', 'log', 'pacemaker', 'pacemaker.log'), tail=500)
+    # Also check messages for pacemaker/corosync
+    pcs_all = pcs_content + corosync_log + pacemaker_log
+    if pcs_all:
+        pcs_recovery_re = re.compile(r'(fenc|stonith|recover|fail.?over|reboot.*node|resource.*(fail|stop|restart|migrate))', re.I)
+        pcs_issues = pcs_recovery_re.findall(pcs_all)
+        if pcs_issues:
+            add("Pacemaker", "Pacemaker cluster recovery issues", "info",
+                f"{len(pcs_issues)} cluster event(s) (failover/fencing/recovery)")
+        else:
+            add("Pacemaker", "Pacemaker cluster recovery issues", "info",
+                "Pacemaker present, no recovery events detected")
+
+    # ── Performance ───────────────────────────────────────────────────
+    # 1. OOM Kill Analysis
+    if critical_events:
+        oom_events = [e for e in critical_events
+                      if e.get('category') == 'Memory/OOM' and e.get('severity') == 'critical']
+        if oom_events:
+            add("Performance", "OOM Kill Analysis", "critical",
+                f"{len(oom_events)} OOM kill event(s) detected")
+
+    # 2. System Performance Analysis (from SAR anomalies - will be enriched in UI)
+    add("Performance", "System Performance Analysis", "info", "See Performance Peaks section for details")
+
+    # 3. System Resource Exhaustion
+    resource_exhaust_re = re.compile(r'(out of memory|cannot allocate|ENOMEM|no space left on device|too many open files|file-max limit)', re.I)
+    resource_issues = resource_exhaust_re.findall(all_boot)
+    if resource_issues:
+        add("Performance", "System Resource Exhaustion Analysis", "critical" if len(resource_issues) > 5 else "info",
+            f"{len(resource_issues)} resource exhaustion event(s)")
+    else:
+        add("Performance", "System Resource Exhaustion Analysis", "info", "No resource exhaustion")
+
+    # ── Repository Errors ─────────────────────────────────────────────
+    # 1. RHUI Connectivity
+    rhui_log = _read(os.path.join(sosreport_path, 'var', 'log', 'rhui', 'rhui.log'))
+    yum_log = _read(os.path.join(sosreport_path, 'var', 'log', 'yum.log'))
+    dnf_log = _read(os.path.join(sosreport_path, 'var', 'log', 'dnf.log'))
+    repo_content = rhui_log + yum_log + dnf_log
+    # Also check sos_commands/yum or dnf
+    for sos_sub in ['sos_commands/yum', 'sos_commands/dnf']:
+        sos_sub_path = os.path.join(sosreport_path, sos_sub)
+        if os.path.isdir(sos_sub_path):
+            for fn in os.listdir(sos_sub_path):
+                if 'repolist' in fn.lower() or 'repoinfo' in fn.lower():
+                    repo_content += _read(os.path.join(sos_sub_path, fn))
+
+    rhui_err_re = re.compile(r'(RHUI|rhui).*(fail|error|timeout|unreachable|Cannot)', re.I)
+    rhui_errs = rhui_err_re.findall(repo_content)
+    if rhui_errs:
+        add("Repository Errors", "RHUI Connectivity", "warning",
+            f"{len(rhui_errs)} RHUI connectivity issue(s)")
+    else:
+        add("Repository Errors", "RHUI Connectivity", "info", "No RHUI issues detected")
+
+    # 2. RHUI Server IP issues
+    rhui_ip_re = re.compile(r'(rhui|repo).*(cannot resolve|Name or service not known|No route to host|Connection refused)', re.I)
+    rhui_ip_errs = rhui_ip_re.findall(repo_content)
+    if rhui_ip_errs:
+        add("Repository Errors", "RHUI Server IP issues", "warning",
+            f"{len(rhui_ip_errs)} RHUI DNS/IP issue(s)")
+    else:
+        add("Repository Errors", "RHUI Server IP issues", "info", "No RHUI server IP issues")
+
+    # ── Results (3rd party checks) ────────────────────────────────────
+    # 1. CrowdStrike presence
+    packages = system_info.get('packages', {})
+    all_pkgs = packages.get('all', []) if isinstance(packages.get('all'), list) else []
+    pkg_names_str = ' '.join(str(p) for p in all_pkgs).lower()
+    cs_installed = 'falcon-sensor' in pkg_names_str or 'crowdstrike' in pkg_names_str
+    cs_service_re = re.compile(r'falcon-sensor|crowdstrike', re.I)
+    cs_in_logs = cs_service_re.search(all_boot)
+    if cs_installed or cs_in_logs:
+        add("Results", "Check for CrowdStrike presence", "warning",
+            "CrowdStrike Falcon sensor detected")
+    else:
+        add("Results", "Check for CrowdStrike presence", "info", "CrowdStrike not found")
+
+    # 2. Custom Or 3rd Party Image Analysis
+    os_release = system_info.get('os_release', '')
+    cloud_init_log = _read(os.path.join(sosreport_path, 'var', 'log', 'cloud-init.log'))
+    custom_image_hints = re.compile(r'(custom.?image|marketplace|plan.*info|BillingTag|third.?party)', re.I)
+    is_custom = custom_image_hints.search(cloud_init_log + str(cloud_details))
+    if is_custom:
+        add("Results", "Custom Or 3rd Party Image Analysis", "warning",
+            "Custom or 3rd party image indicators detected")
+    else:
+        add("Results", "Custom Or 3rd Party Image Analysis", "info",
+            "Standard marketplace image")
+
+    # 3. Qualys presence
+    qualys_re = re.compile(r'qualys', re.I)
+    qualys_found = qualys_re.search(pkg_names_str) or qualys_re.search(all_boot[:200_000])
+    if qualys_found:
+        add("Results", "Check for Qualys presence", "warning", "Qualys agent detected")
+    else:
+        add("Results", "Check for Qualys presence", "info", "Qualys not found")
+
+    # ── SLES ──────────────────────────────────────────────────────────
+    os_flavor = system_info.get('os_release', '').lower()
+    if 'suse' in os_flavor or 'sles' in os_flavor:
+        rmt_re = re.compile(r'(RMT|SUSEConnect|registration).*(fail|error|timeout|refused)', re.I)
+        suseconnect_log = _read(os.path.join(sosreport_path, 'var', 'log', 'YaST2', 'registration.log'))
+        zypper_log = _read(os.path.join(sosreport_path, 'var', 'log', 'zypper.log'), tail=500)
+        sles_content = suseconnect_log + zypper_log + repo_content
+        rmt_errs = rmt_re.findall(sles_content)
+        if rmt_errs:
+            add("SLES", "RMT Connectivity", "warning",
+                f"{len(rmt_errs)} RMT/registration connectivity issue(s)")
+        else:
+            add("SLES", "RMT Connectivity", "info", "RMT connectivity OK or not applicable")
+
+    # ── System Config ─────────────────────────────────────────────────
+    # 1. Repositories Analysis
+    repo_errors = re.compile(r'(repo.*error|Cannot find|Errors during downloading|status code: (404|403|500))', re.I)
+    repo_errs = repo_errors.findall(repo_content)
+    if repo_errs:
+        add("System Config", "Repositories Analysis", "warning",
+            f"{len(repo_errs)} repository error(s) detected")
+    else:
+        add("System Config", "Repositories Analysis", "info", "No repository errors")
+
+    # 2. FSTAB mount analysis
+    if fstab_content:
+        fstab_lines = [l.strip() for l in fstab_content.splitlines()
+                       if l.strip() and not l.strip().startswith('#')]
+        # Check for device paths (not UUID/LABEL) which are risky
+        dev_mounts = [l for l in fstab_lines if l.startswith('/dev/sd')]
+        nofail_missing = [l for l in fstab_lines
+                          if not l.startswith('#') and 'nofail' not in l
+                          and not any(l.startswith(x) for x in ['proc', 'sysfs', 'devpts', 'tmpfs', 'devtmpfs'])]
+        issues = []
+        if dev_mounts:
+            issues.append(f"{len(dev_mounts)} mount(s) use /dev/sd* (not UUID — risky after reboot)")
+        if issues:
+            add("System Config", "FSTAB mount analysis", "critical", '; '.join(issues))
+        else:
+            add("System Config", "FSTAB mount analysis", "info", "FSTAB looks healthy")
+
+    # 3. Detect hostname change
+    hostname = system_info.get('hostname', '')
+    hostname_re = re.compile(r'hostname.*changed|set-hostname|hostnamectl.*set', re.I)
+    hostname_changes = hostname_re.findall(all_boot)
+    if hostname_changes:
+        add("System Config", "Detect hostname change", "info",
+            f"Hostname change detected ({len(hostname_changes)} occurrence(s))")
+    else:
+        add("System Config", "Detect hostname change", "info", f"Hostname stable: {hostname}")
+
+    # 4. Network DHCP Configuration
+    net_config = system_info.get('network_config', {})
+    nm_conns = net_config.get('nm_connections', '')
+    ifcfg_dir = os.path.join(sosreport_path, 'etc', 'sysconfig', 'network-scripts')
+    dhcp_configured = False
+    if os.path.isdir(ifcfg_dir):
+        for fn in os.listdir(ifcfg_dir):
+            if fn.startswith('ifcfg-'):
+                content = _read(os.path.join(ifcfg_dir, fn))
+                if re.search(r'BOOTPROTO\s*=\s*["\']?dhcp', content, re.I):
+                    dhcp_configured = True
+                    break
+    if not dhcp_configured and nm_conns:
+        dhcp_configured = 'auto' in nm_conns.lower() or 'dhcp' in nm_conns.lower()
+    if dhcp_configured:
+        add("System Config", "Network DHCP Configuration", "warning",
+            "DHCP is configured for at least one interface")
+    else:
+        add("System Config", "Network DHCP Configuration", "info", "Static IP or no DHCP detected")
+
+    # 5. NVMe presence
+    lsblk_content = ""
+    for fn_cand in ['sos_commands/block/lsblk', 'sos_commands/block/lsblk_-o_NAME.KNAME.MAJ_MIN.FSTYPE.MOUNTPOINT.LABEL.UUID.RA.MODEL.SIZE.STATE.OWNER.GROUP.MODE.ALIGNMENT.MIN-IO.OPT-IO.PHY-SEC.LOG-SEC.ROTA.SCHED.RQ-SIZE.DISC-ALN.DISC-GRAN.DISC-MAX.DISC-ZERO.TYPE.HCTL.TRAN.REV.VENDOR']:
+        content = _read(os.path.join(sosreport_path, fn_cand))
+        if content:
+            lsblk_content = content
+            break
+    nvme_re = re.compile(r'nvme', re.I)
+    if nvme_re.search(lsblk_content) or nvme_re.search(all_boot[:200_000]):
+        add("System Config", "Check for NVMe presence", "info",
+            "NVMe device(s) detected")
+    else:
+        add("System Config", "Check for NVMe presence", "info", "No NVMe devices")
+
+    # 6. SSH Security Analysis
+    sshd_config = _read(os.path.join(sosreport_path, 'etc', 'ssh', 'sshd_config'))
+    ssh_issues = []
+    if re.search(r'^\s*PermitRootLogin\s+(yes|without-password)', sshd_config, re.M | re.I):
+        ssh_issues.append("PermitRootLogin is enabled")
+    if re.search(r'^\s*PasswordAuthentication\s+yes', sshd_config, re.M | re.I):
+        ssh_issues.append("PasswordAuthentication is enabled")
+    if re.search(r'^\s*PermitEmptyPasswords\s+yes', sshd_config, re.M | re.I):
+        ssh_issues.append("PermitEmptyPasswords is enabled")
+    if ssh_issues:
+        add("System Config", "SSH Security Analysis", "warning", '; '.join(ssh_issues))
+    else:
+        add("System Config", "SSH Security Analysis", "info", "SSH configuration looks secure")
+
+    # Sort categories and findings by severity
+    severity_order = {'critical': 0, 'warning': 1, 'info': 2}
+    for cat in findings:
+        findings[cat].sort(key=lambda f: severity_order.get(f['severity'], 3))
+
+    return findings
+
+
 def generate_copy_paste_summary(hostname: str, system_info: dict, sar_anomalies: dict,
                                 critical_events: list, critical_summary: dict,
                                 sar_metrics_count: int, logs_count: int,
                                 patch_compliance: dict = None,
-                                log_summary: dict = None) -> str:
+                                log_summary: dict = None,
+                                health_checks: dict = None) -> str:
     """Generate a formatted text summary ready to paste into tickets/emails
     
     Returns a pre-formatted plain text summary of the SOSreport analysis.
@@ -2901,6 +3428,24 @@ def generate_copy_paste_summary(hostname: str, system_info: dict, sar_anomalies:
         for dump in crash_dumps['dumps'][:5]:
             reason = dump.get('crash_reason', 'Unknown')
             lines.append(f"  - {dump['directory']}: {reason}")
+        lines.append("")
+    
+    # System Health Checks (V7.1)
+    if health_checks:
+        lines.append("--- SYSTEM HEALTH CHECKS ---")
+        _sev_icon = {'critical': '[CRITICAL]', 'warning': '[WARNING]', 'info': '[INFO]'}
+        for cat_name, cat_findings in sorted(health_checks.items()):
+            cat_crit = sum(1 for f in cat_findings if f['severity'] == 'critical')
+            cat_warn = sum(1 for f in cat_findings if f['severity'] == 'warning')
+            if cat_crit > 0 or cat_warn > 0:
+                lines.append(f"  {cat_name} ({len(cat_findings)} checks):")
+                for f in cat_findings:
+                    if f['severity'] in ('critical', 'warning'):
+                        lines.append(f"    {_sev_icon[f['severity']]} {f['name']}: {f.get('details', '')}")
+        hc_crit = sum(1 for c in health_checks.values() for f in c if f['severity'] == 'critical')
+        hc_warn = sum(1 for c in health_checks.values() for f in c if f['severity'] == 'warning')
+        if hc_crit == 0 and hc_warn == 0:
+            lines.append("  All health checks passed (no critical/warning findings)")
         lines.append("")
     
     # Data Summary
@@ -6953,6 +7498,17 @@ def main():
                 actionable_events = [e for e in critical_events if e.get('severity') in ('critical', 'warning')]
                 correlations = correlate_timestamps(sar_metrics, actionable_events, window_minutes=5) if actionable_events and sar_metrics else []
                 
+                # ---- Run system health checks (V7.1) ----
+                progress_bar.progress(74, "Running health checks...")
+                status_text.text("🔍 Running system health checks...")
+                _t0 = _time.time()
+                health_checks = run_system_health_checks(
+                    sosreport_path, system_info,
+                    critical_events=critical_events,
+                    patch_compliance=patch_compliance,
+                )
+                _timings['Health Checks'] = _time.time() - _t0
+                
                 # ---- Pre-compute SAR display metadata ----
                 sar_files_display = []
                 for _f in sar_files_found:
@@ -6976,7 +7532,8 @@ def main():
                     critical_events=critical_events, critical_summary=critical_summary,
                     sar_metrics_count=len(sar_metrics), logs_count=len(logs),
                     patch_compliance=patch_compliance,
-                    log_summary=log_parser.summary
+                    log_summary=log_parser.summary,
+                    health_checks=health_checks,
                 )
                 
                 progress_bar.progress(75, "Analysis complete! Pushing data...")
@@ -7137,6 +7694,7 @@ from(bucket: "{INFLUXDB_BUCKET}")
                     'critical_summary': critical_summary,
                     'correlations': correlations,
                     'patch_compliance': patch_compliance,
+                    'health_checks': health_checks,
                     'summary_text': summary_text,
                     'push_results': results,
                     'timings': dict(_timings),
@@ -7798,6 +8356,68 @@ from(bucket: "{INFLUXDB_BUCKET}")
                     if count > 0:
                         st.write(f"- {label}: {count:,}")
                 st.metric("Total Logs", f"{_log_count:,}")
+
+            # ============= SYSTEM HEALTH CHECKS (V7.1) =============
+            health_checks = _ad.get('health_checks', {})
+            if health_checks:
+                st.markdown("---")
+                # Count totals per severity
+                _hc_total = sum(len(v) for v in health_checks.values())
+                _hc_crit = sum(1 for cat in health_checks.values() for f in cat if f['severity'] == 'critical')
+                _hc_warn = sum(1 for cat in health_checks.values() for f in cat if f['severity'] == 'warning')
+                _hc_info = sum(1 for cat in health_checks.values() for f in cat if f['severity'] == 'info')
+
+                if _hc_crit > 0:
+                    st.header("🔍 System Health Checks")
+                    st.error(f"🔴 **{_hc_crit} critical** &nbsp;|&nbsp; 🟡 **{_hc_warn} warning** &nbsp;|&nbsp; 🔵 **{_hc_info} info** &nbsp;|&nbsp; **{len(health_checks)} categories**, **{_hc_total} checks**")
+                elif _hc_warn > 0:
+                    st.header("🔍 System Health Checks")
+                    st.warning(f"🟡 **{_hc_warn} warning** &nbsp;|&nbsp; 🔵 **{_hc_info} info** &nbsp;|&nbsp; **{len(health_checks)} categories**, **{_hc_total} checks**")
+                else:
+                    st.header("🔍 System Health Checks")
+                    st.success(f"🔵 **{_hc_info} info** &nbsp;|&nbsp; **{len(health_checks)} categories**, **{_hc_total} checks** — all clear")
+
+                _sev_badge = {'critical': '🔴 Critical', 'warning': '🟡 Warning', 'info': '🔵 Info'}
+                _sev_order = {'critical': 0, 'warning': 1, 'info': 2}
+
+                # Sort categories: those with critical findings first
+                _sorted_cats = sorted(health_checks.items(),
+                                      key=lambda kv: (min(_sev_order.get(f['severity'], 3) for f in kv[1]), kv[0]))
+
+                # Display as a two-column grid of categories (like the screenshot)
+                _cat_items = list(_sorted_cats)
+                _left_cats = _cat_items[:len(_cat_items)//2 + len(_cat_items) % 2]
+                _right_cats = _cat_items[len(_cat_items)//2 + len(_cat_items) % 2:]
+
+                _hc_col1, _hc_col2 = st.columns(2)
+
+                def _render_health_category(container, cat_name, findings_list):
+                    with container:
+                        _cat_crit = sum(1 for f in findings_list if f['severity'] == 'critical')
+                        _cat_warn = sum(1 for f in findings_list if f['severity'] == 'warning')
+                        _cat_count = len(findings_list)
+                        # Category header with count badge
+                        _expand = _cat_crit > 0  # auto-expand if critical
+                        with st.expander(f"▸ **{cat_name}** ({_cat_count})", expanded=_expand):
+                            for finding in findings_list:
+                                _badge = _sev_badge.get(finding['severity'], finding['severity'])
+                                _name = finding['name']
+                                _detail = finding.get('details', '')
+                                if finding['severity'] == 'critical':
+                                    st.markdown(f"&nbsp;&nbsp; {_badge} &nbsp; **{_name}**")
+                                    if _detail:
+                                        st.caption(f"&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; {_detail}")
+                                elif finding['severity'] == 'warning':
+                                    st.markdown(f"&nbsp;&nbsp; {_badge} &nbsp; {_name}")
+                                    if _detail:
+                                        st.caption(f"&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; {_detail}")
+                                else:
+                                    st.markdown(f"&nbsp;&nbsp; {_badge} &nbsp; {_name}")
+
+                for cat_name, findings_list in _left_cats:
+                    _render_health_category(_hc_col1, cat_name, findings_list)
+                for cat_name, findings_list in _right_cats:
+                    _render_health_category(_hc_col2, cat_name, findings_list)
 
             # Critical Events Summary (with severity classification)
             if critical_events:
