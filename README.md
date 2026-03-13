@@ -285,6 +285,98 @@ Panels include: CPU usage (stacked), memory, disk I/O, network, load average, sy
 | Grafana 401 Unauthorized | Regenerate API key in Grafana → Service Accounts |
 | Slow parsing (>10 min) | Normal for 70MB+ sosreports; V7 optimizations help |
 
+### WSL2 + Docker Issues
+
+#### `docker buildx` error when running `docker compose up --build`
+
+This happens when the Docker **apt repository** isn't configured — the `docker-buildx-plugin` package doesn't exist in the default Ubuntu repos.
+
+**Fix 1 — Add the Docker repo, then install (recommended):**
+
+```bash
+# Inside WSL:
+sudo apt-get update && sudo apt-get install -y ca-certificates curl gnupg
+
+# Add Docker's official GPG key and apt repo:
+sudo install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+  | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+sudo chmod a+r /etc/apt/keyrings/docker.gpg
+
+CODENAME=$(. /etc/os-release && echo "$VERSION_CODENAME")
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+  https://download.docker.com/linux/ubuntu ${CODENAME} stable" \
+  | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+sudo apt-get update
+sudo apt-get install -y docker-buildx-plugin docker-compose-plugin
+```
+
+**Fix 2 — Download the binary directly (no apt repo needed):**
+
+```bash
+sudo mkdir -p /usr/local/lib/docker/cli-plugins
+sudo curl -fsSL https://github.com/docker/buildx/releases/download/v0.32.1/buildx-v0.32.1.linux-amd64 \
+  -o /usr/local/lib/docker/cli-plugins/docker-buildx
+sudo chmod +x /usr/local/lib/docker/cli-plugins/docker-buildx
+
+# Verify:
+docker buildx version
+```
+
+> **Tip:** Running `./setup.sh` handles all of this automatically — it adds the Docker repo if missing, then installs both plugins.
+
+#### Ports not accessible from Windows browser
+
+WSL2 usually forwards ports automatically, but if `http://localhost:8501` doesn't work:
+
+```powershell
+# From PowerShell (admin) — get WSL IP:
+wsl hostname -I
+
+# Then access via that IP, e.g. http://172.x.x.x:8501
+```
+
+If ports are blocked, add a Windows port proxy:
+
+```powershell
+# Run as Administrator:
+$wslIP = (wsl hostname -I).Trim().Split(" ")[0]
+foreach ($port in 8501, 8086, 3100, 3000) {
+    netsh interface portproxy add v4tov4 listenport=$port listenaddress=0.0.0.0 connectport=$port connectaddress=$wslIP
+}
+```
+
+#### Docker daemon not starting in WSL
+
+```bash
+# Check if dockerd is running:
+sudo service docker status
+
+# Start it:
+sudo service docker start
+
+# If systemd is available (WSL 0.67.6+):
+sudo systemctl start docker
+sudo systemctl enable docker
+
+# Add yourself to the docker group (avoids 'permission denied'):
+sudo usermod -aG docker $USER
+# Then close and reopen your WSL terminal
+```
+
+#### `docker compose` not found (only `docker-compose` works)
+
+You have the old standalone Compose v1. Install the v2 plugin:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y docker-compose-plugin docker-buildx-plugin
+
+# Verify:
+docker compose version   # should show v2.x
+```
+
 ## License
 
 MIT License

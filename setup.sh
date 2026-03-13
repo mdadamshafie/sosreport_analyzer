@@ -20,14 +20,16 @@ error() { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# ── 1. Docker Engine ─────────────────────────────────────────
-install_docker() {
-    info "Installing Docker Engine …"
+# ── Helper: ensure Docker apt repo is configured ─────────────
+ensure_docker_repo() {
+    if [ -f /etc/apt/sources.list.d/docker.list ]; then
+        return 0   # already set up
+    fi
+    info "Adding Docker apt repository …"
     sudo apt-get update -qq
     sudo apt-get install -y -qq \
         ca-certificates curl gnupg lsb-release >/dev/null
 
-    # Add Docker GPG key
     sudo install -m 0755 -d /etc/apt/keyrings
     if [ ! -f /etc/apt/keyrings/docker.gpg ]; then
         curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
@@ -35,7 +37,6 @@ install_docker() {
         sudo chmod a+r /etc/apt/keyrings/docker.gpg
     fi
 
-    # Add Docker repo  (works for Ubuntu & most Debian-based WSL distros)
     DISTRO=$(. /etc/os-release && echo "$ID")
     CODENAME=$(. /etc/os-release && echo "$VERSION_CODENAME")
     echo \
@@ -44,6 +45,13 @@ install_docker() {
       | sudo tee /etc/apt/sources.list.d/docker.list >/dev/null
 
     sudo apt-get update -qq
+}
+
+# ── 1. Docker Engine ─────────────────────────────────────────
+install_docker() {
+    info "Installing Docker Engine …"
+    ensure_docker_repo
+
     sudo apt-get install -y -qq \
         docker-ce docker-ce-cli containerd.io \
         docker-buildx-plugin docker-compose-plugin >/dev/null
@@ -62,9 +70,29 @@ fi
 # ── 2. Docker Compose plugin ────────────────────────────────
 if ! docker compose version &>/dev/null; then
     warn "docker compose plugin not found – installing …"
+    ensure_docker_repo
     sudo apt-get install -y -qq docker-compose-plugin >/dev/null
 fi
 info "Docker Compose $(docker compose version --short)"
+
+# ── 2b. Docker Buildx plugin (required for 'docker compose --build') ─
+if ! docker buildx version &>/dev/null 2>&1; then
+    warn "docker buildx plugin not found – installing …"
+    ensure_docker_repo
+    sudo apt-get install -y -qq docker-buildx-plugin 2>/dev/null || true
+    # Verify it installed correctly; if not, download binary directly
+    if ! docker buildx version &>/dev/null 2>&1; then
+        warn "apt package unavailable – installing buildx from GitHub release …"
+        BUILDX_VERSION=$(curl -s https://api.github.com/repos/docker/buildx/releases/latest \
+            | grep -oP '"tag_name": "\K[^"]+' || echo "v0.32.1")
+        BUILDX_URL="https://github.com/docker/buildx/releases/download/${BUILDX_VERSION}/buildx-${BUILDX_VERSION}.linux-$(dpkg --print-architecture)"
+        sudo mkdir -p /usr/local/lib/docker/cli-plugins
+        sudo curl -fsSL "$BUILDX_URL" -o /usr/local/lib/docker/cli-plugins/docker-buildx
+        sudo chmod +x /usr/local/lib/docker/cli-plugins/docker-buildx
+    fi
+    docker buildx version &>/dev/null 2>&1 || error "Failed to install docker buildx. Please install manually."
+fi
+info "Docker Buildx $(docker buildx version 2>/dev/null | head -1)"
 
 # ── 3. Ensure Docker daemon is running ──────────────────────
 if ! docker info &>/dev/null 2>&1; then
