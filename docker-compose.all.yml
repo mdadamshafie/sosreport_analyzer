@@ -67,6 +67,11 @@ services:
     volumes:
       - grafana_data:/var/lib/grafana
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost:3000/api/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
     depends_on:
       influxdb:
         condition: service_healthy
@@ -96,6 +101,8 @@ services:
       influxdb:
         condition: service_healthy
       loki:
+        condition: service_healthy
+      grafana:
         condition: service_healthy
 
 volumes:

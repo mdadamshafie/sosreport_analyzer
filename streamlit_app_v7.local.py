@@ -74,7 +74,7 @@ def _resolve_influxdb_org(url, token, org_hint):
         resp = requests.get(
             f"{url}/api/v2/orgs",
             headers={"Authorization": f"Token {token}"},
-            timeout=5,
+            timeout=10,
         )
         if resp.status_code == 200:
             orgs = resp.json().get("orgs", [])
@@ -89,60 +89,76 @@ def _resolve_influxdb_org(url, token, org_hint):
 if not INFLUXDB_ORG or INFLUXDB_ORG.lower() == "auto":
     INFLUXDB_ORG = _resolve_influxdb_org(INFLUXDB_URL, INFLUXDB_TOKEN, INFLUXDB_ORG)
 
-# ── Auto-provision Grafana API key when not set ───────────────────────
+# ── Auto-provision Grafana API key (lazy — called on first use) ───────
 def _auto_provision_grafana_key(url, admin_user="admin", admin_pass="sosreport2026"):
-    """Create a Grafana service account + token using admin basic auth."""
-    try:
-        session = requests.Session()
-        session.auth = (admin_user, admin_pass)
+    """Create a Grafana service account + token using admin basic auth.
+    Retries a few times in case Grafana is still starting up."""
+    import time as _t
+    for attempt in range(6):
+        try:
+            session = requests.Session()
+            session.auth = (admin_user, admin_pass)
 
-        # Check if Grafana is reachable
-        health = session.get(f"{url}/api/health", timeout=5)
-        if health.status_code != 200:
-            return ""
+            health = session.get(f"{url}/api/health", timeout=5)
+            if health.status_code != 200:
+                _t.sleep(5)
+                continue
 
-        # Create or reuse service account
-        sa_name = "sosreport-auto"
-        resp = session.get(f"{url}/api/serviceaccounts/search?query={sa_name}", timeout=5)
-        sa_id = None
-        if resp.status_code == 200:
-            for sa in resp.json().get("serviceAccounts", []):
-                if sa.get("name") == sa_name:
-                    sa_id = sa["id"]
-                    break
+            # Create or reuse service account
+            sa_name = "sosreport-auto"
+            resp = session.get(f"{url}/api/serviceaccounts/search?query={sa_name}", timeout=5)
+            sa_id = None
+            if resp.status_code == 200:
+                for sa in resp.json().get("serviceAccounts", []):
+                    if sa.get("name") == sa_name:
+                        sa_id = sa["id"]
+                        break
 
-        if not sa_id:
+            if not sa_id:
+                resp = session.post(
+                    f"{url}/api/serviceaccounts",
+                    json={"name": sa_name, "role": "Admin"},
+                    timeout=5,
+                )
+                if resp.status_code in (200, 201):
+                    sa_id = resp.json().get("id")
+                else:
+                    logging.warning(f"Grafana SA create failed: {resp.status_code} {resp.text[:200]}")
+                    _t.sleep(5)
+                    continue
+
+            # Create token (delete existing ones first to avoid conflicts)
+            resp = session.get(f"{url}/api/serviceaccounts/{sa_id}/tokens", timeout=5)
+            if resp.status_code == 200:
+                for tok in resp.json():
+                    session.delete(f"{url}/api/serviceaccounts/{sa_id}/tokens/{tok['id']}", timeout=5)
+
             resp = session.post(
-                f"{url}/api/serviceaccounts",
-                json={"name": sa_name, "role": "Admin"},
+                f"{url}/api/serviceaccounts/{sa_id}/tokens",
+                json={"name": "auto-token"},
                 timeout=5,
             )
             if resp.status_code in (200, 201):
-                sa_id = resp.json().get("id")
+                key = resp.json().get("key", "")
+                logging.info("Auto-provisioned Grafana API key")
+                return key
             else:
-                return ""
-
-        # Create token (delete existing ones first to avoid conflicts)
-        resp = session.get(f"{url}/api/serviceaccounts/{sa_id}/tokens", timeout=5)
-        if resp.status_code == 200:
-            for tok in resp.json():
-                session.delete(f"{url}/api/serviceaccounts/{sa_id}/tokens/{tok['id']}", timeout=5)
-
-        resp = session.post(
-            f"{url}/api/serviceaccounts/{sa_id}/tokens",
-            json={"name": "auto-token"},
-            timeout=5,
-        )
-        if resp.status_code in (200, 201):
-            key = resp.json().get("key", "")
-            logging.info("Auto-provisioned Grafana API key")
-            return key
-    except Exception as e:
-        logging.warning(f"Could not auto-provision Grafana API key: {e}")
+                logging.warning(f"Grafana token create failed: {resp.status_code} {resp.text[:200]}")
+        except requests.exceptions.ConnectionError:
+            logging.info(f"Grafana not ready (attempt {attempt+1}/6), retrying in 5s...")
+        except Exception as e:
+            logging.warning(f"Grafana auto-provision error: {e}")
+        _t.sleep(5)
+    logging.error("Could not auto-provision Grafana API key after retries")
     return ""
 
-if not GRAFANA_API_KEY:
-    GRAFANA_API_KEY = _auto_provision_grafana_key(GRAFANA_URL)
+
+def _get_grafana_api_key():
+    """Lazy getter — provisions the key on first call, caches it globally."""
+    global GRAFANA_API_KEY
+    if not GRAFANA_API_KEY:
+        GRAFANA_API_KEY = _auto_provision_grafana_key(GRAFANA_URL)
+    return GRAFANA_API_KEY
 
 # Performance Configuration
 MAX_CONCURRENT_EXTRACTIONS = 3  # Limit concurrent heavy operations
@@ -6853,7 +6869,7 @@ def delete_grafana_dashboard(hostname: str) -> Tuple[bool, str]:
     try:
         resp = requests.delete(
             f"{GRAFANA_URL}/api/dashboards/uid/{uid}",
-            headers={"Authorization": f"Bearer {GRAFANA_API_KEY}"},
+            headers={"Authorization": f"Bearer {_get_grafana_api_key()}"},
             timeout=15
         )
         if resp.status_code == 200:
@@ -7355,7 +7371,7 @@ def create_grafana_dashboard(hostname: str, time_from: datetime = None, time_to:
         sar_anomalies: SAR anomaly detection results from analyze_sar_anomalies()
     """
     session = requests.Session()
-    session.headers['Authorization'] = f'Bearer {GRAFANA_API_KEY}'
+    session.headers['Authorization'] = f'Bearer {_get_grafana_api_key()}'
     
     # Get datasource UIDs
     response = session.get(f"{GRAFANA_URL}/api/datasources")
@@ -7771,7 +7787,7 @@ def check_grafana_health() -> Tuple[bool, str]:
     """
     try:
         # Use /api/org endpoint with auth (works better with Azure Grafana which requires auth)
-        headers = {"Authorization": f"Bearer {GRAFANA_API_KEY}"}
+        headers = {"Authorization": f"Bearer {_get_grafana_api_key()}"}
         response = requests.get(f"{GRAFANA_URL}/api/org", headers=headers, timeout=10)
         if response.status_code == 200:
             data = response.json()
