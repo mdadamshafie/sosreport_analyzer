@@ -7371,7 +7371,11 @@ def create_grafana_dashboard(hostname: str, time_from: datetime = None, time_to:
         sar_anomalies: SAR anomaly detection results from analyze_sar_anomalies()
     """
     session = requests.Session()
-    session.headers['Authorization'] = f'Bearer {_get_grafana_api_key()}'
+    api_key = _get_grafana_api_key()
+    if not api_key:
+        logging.error("Grafana API key is empty — cannot create dashboard")
+        return None
+    session.headers['Authorization'] = f'Bearer {api_key}'
     
     # Get datasource UIDs
     response = session.get(f"{GRAFANA_URL}/api/datasources")
@@ -7384,8 +7388,11 @@ def create_grafana_dashboard(hostname: str, time_from: datetime = None, time_to:
                 influx_uid = ds.get('uid')
             elif ds.get('type') == 'loki':
                 loki_uid = ds.get('uid')
+    else:
+        logging.error(f"Grafana datasources API returned {response.status_code}: {response.text[:200]}")
     
     if not influx_uid or not loki_uid:
+        logging.error(f"Missing datasource UIDs: influx={influx_uid}, loki={loki_uid}")
         return None
     
     safe_host = re.sub(r'[^a-zA-Z0-9_-]', '-', hostname)[:36]
@@ -7697,6 +7704,7 @@ def create_grafana_dashboard(hostname: str, time_from: datetime = None, time_to:
         # Use external URL for browser-facing links (GRAFANA_URL may be internal Docker hostname)
         return f"{GRAFANA_EXTERNAL_URL}{result.get('url', '')}"
     
+    logging.error(f"Grafana dashboard creation failed: {response.status_code} {response.text[:300]}")
     return None
 
 
@@ -8345,6 +8353,9 @@ from(bucket: "{INFLUXDB_BUCKET}")
                         results['dashboard'] = dashboard_url
                         st.success(f"✅ Dashboard created!")
                         st.markdown(f"🔗 [Open Dashboard]({dashboard_url})")
+                    else:
+                        st.warning("⚠️ Dashboard creation failed — check Grafana connectivity and API key. "
+                                   "View container logs: `docker compose -f docker-compose.all.yml logs app`")
                 
                 progress_bar.progress(100, "Complete!")
                 _timings['_total'] = _time.time() - _total_start

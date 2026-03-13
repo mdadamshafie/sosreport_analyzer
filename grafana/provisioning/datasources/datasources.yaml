@@ -10,8 +10,10 @@ datasources:
       version: Flux
       organization: sosanalyzer
       defaultBucket: sar_metrics
+      httpHeaderName1: "Authorization"
     secureJsonData:
-      token: ${INFLUXDB_TOKEN}
+      token: local-sosreport-token-2026
+      httpHeaderValue1: "Token local-sosreport-token-2026"
     isDefault: true
 
   - name: Loki
