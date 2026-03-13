@@ -28,7 +28,6 @@ ARG CACHEBUST=1
 # Copy application code
 COPY streamlit_app_v7.local.py ./streamlit_app.py
 COPY .streamlit/ ./.streamlit/
-COPY grafana/ ./grafana/
 
 # Streamlit config – headless, dark theme, CORS-friendly
 ENV STREAMLIT_SERVER_HEADLESS=true \
