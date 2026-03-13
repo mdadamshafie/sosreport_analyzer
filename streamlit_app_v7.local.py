@@ -53,13 +53,96 @@ load_dotenv()  # Load .env file
 # ============================================================================
 INFLUXDB_URL = os.environ.get("INFLUXDB_URL", "http://localhost:8086")
 INFLUXDB_TOKEN = os.environ.get("INFLUXDB_TOKEN", "")
-INFLUXDB_ORG = os.environ.get("INFLUXDB_ORG_ID", "")
+# Prefer INFLUXDB_ORG (name) for API calls; fall back to INFLUXDB_ORG_ID if set and not 'auto'
+_org_id_raw = os.environ.get("INFLUXDB_ORG_ID", "")
+INFLUXDB_ORG = os.environ.get("INFLUXDB_ORG", "") or ("" if _org_id_raw.lower() == "auto" else _org_id_raw)
 INFLUXDB_BUCKET = os.environ.get("INFLUXDB_BUCKET", "sar_metrics")
 
 LOKI_URL = os.environ.get("LOKI_URL", "http://localhost:3100")
 
 GRAFANA_URL = os.environ.get("GRAFANA_URL", "http://localhost:3000")
+# External URL for links shown to the user's browser (falls back to GRAFANA_URL)
+GRAFANA_EXTERNAL_URL = os.environ.get("GRAFANA_EXTERNAL_URL", "") or GRAFANA_URL.replace("://grafana:", "://localhost:")
 GRAFANA_API_KEY = os.environ.get("GRAFANA_API_KEY", "")
+
+# ── Auto-resolve InfluxDB org name when not configured ────────────────
+def _resolve_influxdb_org(url, token, org_hint):
+    """Resolve InfluxDB org name from the API if org_hint is empty or 'auto'."""
+    if org_hint and org_hint.lower() != "auto":
+        return org_hint
+    try:
+        resp = requests.get(
+            f"{url}/api/v2/orgs",
+            headers={"Authorization": f"Token {token}"},
+            timeout=5,
+        )
+        if resp.status_code == 200:
+            orgs = resp.json().get("orgs", [])
+            if orgs:
+                resolved = orgs[0]["name"]
+                logging.info(f"Auto-resolved InfluxDB org: {resolved}")
+                return resolved
+    except Exception as e:
+        logging.warning(f"Could not auto-resolve InfluxDB org: {e}")
+    return org_hint
+
+if not INFLUXDB_ORG or INFLUXDB_ORG.lower() == "auto":
+    INFLUXDB_ORG = _resolve_influxdb_org(INFLUXDB_URL, INFLUXDB_TOKEN, INFLUXDB_ORG)
+
+# ── Auto-provision Grafana API key when not set ───────────────────────
+def _auto_provision_grafana_key(url, admin_user="admin", admin_pass="sosreport2026"):
+    """Create a Grafana service account + token using admin basic auth."""
+    try:
+        session = requests.Session()
+        session.auth = (admin_user, admin_pass)
+
+        # Check if Grafana is reachable
+        health = session.get(f"{url}/api/health", timeout=5)
+        if health.status_code != 200:
+            return ""
+
+        # Create or reuse service account
+        sa_name = "sosreport-auto"
+        resp = session.get(f"{url}/api/serviceaccounts/search?query={sa_name}", timeout=5)
+        sa_id = None
+        if resp.status_code == 200:
+            for sa in resp.json().get("serviceAccounts", []):
+                if sa.get("name") == sa_name:
+                    sa_id = sa["id"]
+                    break
+
+        if not sa_id:
+            resp = session.post(
+                f"{url}/api/serviceaccounts",
+                json={"name": sa_name, "role": "Admin"},
+                timeout=5,
+            )
+            if resp.status_code in (200, 201):
+                sa_id = resp.json().get("id")
+            else:
+                return ""
+
+        # Create token (delete existing ones first to avoid conflicts)
+        resp = session.get(f"{url}/api/serviceaccounts/{sa_id}/tokens", timeout=5)
+        if resp.status_code == 200:
+            for tok in resp.json():
+                session.delete(f"{url}/api/serviceaccounts/{sa_id}/tokens/{tok['id']}", timeout=5)
+
+        resp = session.post(
+            f"{url}/api/serviceaccounts/{sa_id}/tokens",
+            json={"name": "auto-token"},
+            timeout=5,
+        )
+        if resp.status_code in (200, 201):
+            key = resp.json().get("key", "")
+            logging.info("Auto-provisioned Grafana API key")
+            return key
+    except Exception as e:
+        logging.warning(f"Could not auto-provision Grafana API key: {e}")
+    return ""
+
+if not GRAFANA_API_KEY:
+    GRAFANA_API_KEY = _auto_provision_grafana_key(GRAFANA_URL)
 
 # Performance Configuration
 MAX_CONCURRENT_EXTRACTIONS = 3  # Limit concurrent heavy operations
@@ -7595,7 +7678,8 @@ def create_grafana_dashboard(hostname: str, time_from: datetime = None, time_to:
     
     if response.status_code == 200:
         result = response.json()
-        return f"{GRAFANA_URL}{result.get('url', '')}"
+        # Use external URL for browser-facing links (GRAFANA_URL may be internal Docker hostname)
+        return f"{GRAFANA_EXTERNAL_URL}{result.get('url', '')}"
     
     return None
 
@@ -7766,7 +7850,7 @@ def main():
             pass
         
         st.markdown("---")
-        st.subheader("🔌 Backend Services")
+        st.subheader("🔌 Service Connectivity")
         
         # Auto-check on first load (local Docker = fast), manual refresh via button
         if 'service_status' not in st.session_state:

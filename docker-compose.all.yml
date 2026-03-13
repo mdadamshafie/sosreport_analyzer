@@ -87,10 +87,10 @@ services:
       - INFLUXDB_URL=http://influxdb:8086
       - INFLUXDB_TOKEN=local-sosreport-token-2026
       - INFLUXDB_ORG=sosanalyzer
-      - INFLUXDB_ORG_ID=auto
       - INFLUXDB_BUCKET=sar_metrics
       - LOKI_URL=http://loki:3100
       - GRAFANA_URL=http://grafana:3000
+      - GRAFANA_EXTERNAL_URL=http://localhost:3000
       - GRAFANA_API_KEY=${GRAFANA_API_KEY:-}
     depends_on:
       influxdb:
