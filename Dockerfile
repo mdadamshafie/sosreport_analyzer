@@ -22,9 +22,13 @@ COPY --from=builder /install /usr/local
 # App directory
 WORKDIR /app
 
+# Bust Docker cache when app code changes (set automatically by compose)
+ARG CACHEBUST=1
+
 # Copy application code
 COPY streamlit_app_v7.local.py ./streamlit_app.py
 COPY .streamlit/ ./.streamlit/
+COPY grafana/ ./grafana/
 
 # Streamlit config – headless, dark theme, CORS-friendly
 ENV STREAMLIT_SERVER_HEADLESS=true \

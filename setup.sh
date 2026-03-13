@@ -109,7 +109,7 @@ info "Docker daemon is running."
 
 # ── 4. Build & launch ───────────────────────────────────────
 info "Building & starting all services (InfluxDB, Loki, Grafana, Streamlit) …"
-docker compose -f docker-compose.all.yml up --build -d
+CACHEBUST=$(date +%s) docker compose -f docker-compose.all.yml up --build -d
 
 echo ""
 info "──────────────────────────────────────────────"

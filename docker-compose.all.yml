@@ -83,6 +83,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        CACHEBUST: ${CACHEBUST:-1}
     container_name: sosreport_app
     restart: unless-stopped
     ports:
