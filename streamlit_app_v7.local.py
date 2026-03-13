@@ -61,8 +61,13 @@ INFLUXDB_BUCKET = os.environ.get("INFLUXDB_BUCKET", "sar_metrics")
 LOKI_URL = os.environ.get("LOKI_URL", "http://localhost:3100")
 
 GRAFANA_URL = os.environ.get("GRAFANA_URL", "http://localhost:3000")
-# External URL for links shown to the user's browser (falls back to GRAFANA_URL)
-GRAFANA_EXTERNAL_URL = os.environ.get("GRAFANA_EXTERNAL_URL", "") or GRAFANA_URL.replace("://grafana:", "://localhost:")
+
+# External URLs for links shown to the user's browser
+# Inside Docker, service names (influxdb, loki, grafana) aren't reachable from the browser
+_to_external = lambda u: u.replace("://influxdb:", "://localhost:").replace("://loki:", "://localhost:").replace("://grafana:", "://localhost:")
+INFLUXDB_EXTERNAL_URL = os.environ.get("INFLUXDB_EXTERNAL_URL", "") or _to_external(INFLUXDB_URL)
+LOKI_EXTERNAL_URL = os.environ.get("LOKI_EXTERNAL_URL", "") or _to_external(LOKI_URL)
+GRAFANA_EXTERNAL_URL = os.environ.get("GRAFANA_EXTERNAL_URL", "") or _to_external(GRAFANA_URL)
 GRAFANA_API_KEY = os.environ.get("GRAFANA_API_KEY", "")
 
 # ── Auto-resolve InfluxDB org name when not configured ────────────────
@@ -7896,7 +7901,7 @@ def main():
             st.markdown(f"🟢 **InfluxDB**: {influx_msg}")
         else:
             st.markdown(f"🔴 **InfluxDB**: {influx_msg}")
-        st.caption(f"   {INFLUXDB_URL}")
+        st.caption(f"   {INFLUXDB_EXTERNAL_URL}")
         
         # Display Loki status
         loki_ok, loki_msg = status['loki']
@@ -7904,7 +7909,7 @@ def main():
             st.markdown(f"🟢 **Loki**: {loki_msg}")
         else:
             st.markdown(f"🔴 **Loki**: {loki_msg}")
-        st.caption(f"   {LOKI_URL}")
+        st.caption(f"   {LOKI_EXTERNAL_URL}")
         
         # Display Grafana status
         grafana_ok, grafana_msg = status['grafana']
@@ -7912,7 +7917,7 @@ def main():
             st.markdown(f"🟢 **Grafana**: {grafana_msg}")
         else:
             st.markdown(f"🔴 **Grafana**: {grafana_msg}")
-        st.caption(f"   {GRAFANA_URL}")
+        st.caption(f"   {GRAFANA_EXTERNAL_URL}")
         
         # Show last check time
         if 'last_health_check' in st.session_state:
