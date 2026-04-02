@@ -242,6 +242,7 @@ _SC_FILE_MAP = {
     'sshd_config':  ('security.txt',          '/etc/ssh/sshd_config'),
     # Audit
     'auditd_conf':  ('security.txt',          '/etc/audit/auditd.conf'),
+    'auditd_conf2': ('security-audit.txt',    '/etc/audit/auditd.conf'),
 }
 
 
@@ -346,6 +347,53 @@ def sc_find_file(root_path: str, filename: str) -> str:
     """Find a file in a supportconfig flat directory. Returns path or ''."""
     path = os.path.join(root_path, filename)
     return path if os.path.isfile(path) else ''
+
+
+def sc_extract_log_sections(filepath: str, path_prefix: str) -> str:
+    """Extract ALL log-file sections from a supportconfig .txt file matching a path.
+    
+    Gathers content from sections whose path starts with `path_prefix`.
+    Handles all section types that contain file content:
+      - '#==[ Log File ]======#'
+      - '#==[ File ]======#'
+      - '#==[ Configuration File ]======#'
+    Plus also captures content from any section referencing the path_prefix.
+    This handles rotated logs too (e.g. /var/log/messages, /var/log/messages-20260101).
+    
+    Returns concatenated log content (no section headers).
+    """
+    if not os.path.isfile(filepath):
+        return ''
+    try:
+        with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+            lines = f.readlines()
+    except Exception:
+        return ''
+    
+    result = []
+    capturing = False
+    
+    for i, line in enumerate(lines):
+        m = _SC_SECTION_RE.match(line)
+        if m:
+            capturing = False
+            # Look ahead for the file/command path
+            for j in range(i + 1, min(i + 4, len(lines))):
+                cmd_m = _SC_COMMAND_RE.match(lines[j])
+                if cmd_m:
+                    path = cmd_m.group(1)
+                    if path.startswith(path_prefix) or path_prefix in path:
+                        capturing = True
+                    break
+            continue
+        
+        if capturing:
+            # Skip the comment line with the path itself (# /var/log/messages)
+            if _SC_COMMAND_RE.match(line):
+                continue
+            result.append(line)
+    
+    return ''.join(result).strip()
 
 
 # Refined Critical Events Log Patterns for V7
@@ -736,8 +784,7 @@ def extract_sosreport(uploaded_file, progress_bar, status_text=None) -> Tuple[st
                 )
                 
                 if _is_supportconfig:
-                    # Supportconfig: extract ALL .txt files and any var/log/  
-                    # Supportconfig archives are flat — extract everything
+                    # Supportconfig: extract ALL .txt files, sar/ data, and any var/log/
                     files_to_extract = []
                     for member in members:
                         name = member.name
@@ -746,7 +793,14 @@ def extract_sosreport(uploaded_file, progress_bar, status_text=None) -> Tuple[st
                         elif name.endswith('.txt') or name.endswith('.log') or name.endswith('.xml'):
                             if len(os.path.join(temp_dir, name)) < 250:
                                 files_to_extract.append(member)
+                        elif '/sar/' in name or name.endswith('/sar'):
+                            # Extract SAR data files (sar20250409, sa20250408, etc.)
+                            if len(os.path.join(temp_dir, name)) < 250:
+                                files_to_extract.append(member)
                         elif '/var/log/' in name or '/var/crash/' in name or '/etc/' in name:
+                            if len(os.path.join(temp_dir, name)) < 250:
+                                files_to_extract.append(member)
+                        elif '/public_cloud/' in name or '/docker/' in name:
                             if len(os.path.join(temp_dir, name)) < 250:
                                 files_to_extract.append(member)
                 else:
@@ -839,17 +893,16 @@ def extract_sosreport(uploaded_file, progress_bar, status_text=None) -> Tuple[st
                 
                 progress_bar.progress(40, f"Extracting {len(files_to_extract)} files...")
                 
-                # Extract files with progress updates
-                extracted_count = 0
-                for member in files_to_extract:
+                for i, member in enumerate(files_to_extract):
                     try:
                         tar.extract(member, temp_dir, filter='data')
-                        extracted_count += 1
-                        if extracted_count % 50 == 0:
-                            pct = 40 + int((extracted_count / len(files_to_extract)) * 10)
-                            progress_bar.progress(pct, f"Extracting... {extracted_count}/{len(files_to_extract)}")
+                    except TypeError:
+                        tar.extract(member, temp_dir)
                     except Exception:
                         pass
+                    if i % 50 == 0:
+                        pct = 40 + int((i / max(len(files_to_extract), 1)) * 20)
+                        progress_bar.progress(pct, f"Extracting file {i+1}/{len(files_to_extract)}...")
         
         finally:
             # Remove the archive to free disk space
@@ -875,6 +928,8 @@ def _materialize_supportconfig_paths(sc_root: str):
     This bridge function lets ALL existing sosreport detection logic work unchanged
     with supportconfig archives.
     """
+    _materialized = []  # Track what was created for debugging
+    
     def _write(relpath: str, content: str):
         if not content:
             return
@@ -883,12 +938,32 @@ def _materialize_supportconfig_paths(sc_root: str):
         try:
             with open(dest, 'w', encoding='utf-8') as f:
                 f.write(content)
-        except Exception:
-            pass
+            _materialized.append(f"{relpath} ({len(content)} bytes)")
+        except Exception as e:
+            _materialized.append(f"{relpath} (FAILED: {e})")
+    
+    # Log which .txt files exist in the supportconfig root
+    sc_txt_files = [f for f in os.listdir(sc_root) if f.endswith('.txt')]
+    logging.info(f"Supportconfig root: {sc_root}")
+    logging.info(f"Supportconfig .txt files found: {sc_txt_files}")
 
     # ── System basics ───────────────────────────────────────
-    _write('etc/hostname',
-           sc_read_file(sc_root, 'hostname'))
+    hostname_val = sc_read_file(sc_root, 'hostname')
+    if not hostname_val:
+        # Fallback: extract hostname from uname output
+        uname_out = sc_read_file(sc_root, 'uname')
+        if uname_out:
+            parts = uname_out.strip().split()
+            if len(parts) >= 2 and parts[0] == 'Linux':
+                hostname_val = parts[1]
+        # Fallback: directory name (scc_hostname_YYMMDD)
+        if not hostname_val:
+            dirname = os.path.basename(sc_root)
+            if dirname.startswith(('nts_', 'scc_')):
+                d_parts = dirname.split('_')
+                if len(d_parts) >= 2:
+                    hostname_val = d_parts[1]
+    _write('etc/hostname', hostname_val or '')
     _write('uptime',
            sc_read_file(sc_root, 'uptime'))
     _write('date',
@@ -1003,57 +1078,203 @@ def _materialize_supportconfig_paths(sc_root: str):
 
     # Security / SSH / Audit
     sshd = sc_read_file(sc_root, 'sshd_config')
+    if not sshd:
+        # Try ssh.txt (SUSE separates SSH config into its own file)
+        ssh_txt = os.path.join(sc_root, 'ssh.txt')
+        if os.path.isfile(ssh_txt):
+            sshd = sc_extract_section(ssh_txt, '/etc/ssh/sshd_config')
     if sshd:
         _write('etc/ssh/sshd_config', sshd)
     auditd = sc_read_file(sc_root, 'auditd_conf')
+    if not auditd:
+        auditd = sc_read_file(sc_root, 'auditd_conf2')
     if auditd:
         _write('etc/audit/auditd.conf', auditd)
     sestatus = sc_read_file(sc_root, 'sestatus')
     if sestatus:
         _write('sos_commands/selinux/sestatus', sestatus)
     apparmor = sc_read_file(sc_root, 'apparmor')
+    if not apparmor:
+        # Try security-apparmor.txt
+        apparmor_txt = os.path.join(sc_root, 'security-apparmor.txt')
+        if os.path.isfile(apparmor_txt):
+            apparmor = sc_extract_section(apparmor_txt, '/usr/sbin/apparmor_status')
+            if not apparmor:
+                apparmor = sc_extract_section(apparmor_txt, 'apparmor_status')
     if apparmor:
         _write('sos_commands/apparmor/apparmor_status', apparmor)
 
-    # SAR data — sar.txt is a flat file with all sar -A output
+    # SAR data — supportconfig stores SAR in two places:
+    #   1. sar.txt — usually just verification/copy commands, rarely has actual data
+    #   2. sar/ subdirectory — contains actual text sar files (sar20250409) and binary sa files
+    sar_subdir = os.path.join(sc_root, 'sar')
+    sar_dest = os.path.join(sc_root, 'var', 'log', 'sa')
+    
+    if os.path.isdir(sar_subdir):
+        # Copy sar/ files to var/log/sa/ where the SAR parser looks
+        os.makedirs(sar_dest, exist_ok=True)
+        try:
+            for fname in os.listdir(sar_subdir):
+                src_file = os.path.join(sar_subdir, fname)
+                if os.path.isfile(src_file):
+                    shutil.copy2(src_file, os.path.join(sar_dest, fname))
+                    _materialized.append(f"var/log/sa/{fname} ({os.path.getsize(src_file)} bytes)")
+        except Exception as e:
+            _materialized.append(f"var/log/sa/ copy (FAILED: {e})")
+    
+    # Also check sar.txt for inline SAR output (some supportconfigs embed sar -A output)
     sar_txt = sc_find_file(sc_root, 'sar.txt')
     if sar_txt:
-        # Copy to sos_commands/sar/ so SAR parser finds it
-        os.makedirs(os.path.join(sc_root, 'sos_commands', 'sar'), exist_ok=True)
         try:
-            shutil.copy2(sar_txt, os.path.join(sc_root, 'sos_commands', 'sar', 'sar.txt'))
-        except Exception:
-            pass
+            with open(sar_txt, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read()
+            # Try section-based extraction (get sar command output)
+            sar_content = sc_extract_log_sections(sar_txt, '/usr/bin/sar')
+            if not sar_content:
+                sar_content = sc_extract_log_sections(sar_txt, '/usr/sbin/sar')
+            if not sar_content:
+                # Check if there's actual SAR data after stripping headers
+                clean_lines = []
+                for line in content.splitlines():
+                    if _SC_SECTION_RE.match(line):
+                        continue
+                    if _SC_COMMAND_RE.match(line):
+                        continue
+                    clean_lines.append(line)
+                candidate = '\n'.join(clean_lines).strip()
+                if candidate and 'Linux' in candidate[:200]:
+                    sar_content = candidate
+            
+            if sar_content and 'Linux' in sar_content[:200]:
+                sar_content = sar_content.lstrip('\n\r ')
+                os.makedirs(os.path.join(sc_root, 'sos_commands', 'sar'), exist_ok=True)
+                dest = os.path.join(sc_root, 'sos_commands', 'sar', 'sar.txt')
+                with open(dest, 'w', encoding='utf-8') as f:
+                    f.write(sar_content)
+                _materialized.append(f"sos_commands/sar/sar.txt ({len(sar_content)} bytes)")
+        except Exception as e:
+            _materialized.append(f"sos_commands/sar/sar.txt (FAILED: {e})")
 
-    # Logs — messages.txt, warn.txt, boot.txt map to var/log equivalents
-    for sc_file, var_log_name in [
-        ('messages.txt', 'var/log/messages'),
-        ('warn.txt', 'var/log/warn'),
-        ('boot.txt', 'var/log/boot.log'),
+    # Logs — messages.txt, warn.txt map to var/log equivalents
+    # Use section-based extraction to get only actual log content
+    for sc_file, var_log_path_prefix, var_log_name in [
+        ('messages.txt', '/var/log/messages', 'var/log/messages'),
+        ('warn.txt', '/var/log/warn', 'var/log/warn'),
     ]:
         src = sc_find_file(sc_root, sc_file)
         if src:
-            dest_path = os.path.join(sc_root, var_log_name)
-            os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-            try:
-                # For messages.txt, extract only actual log lines (skip section headers)
-                with open(src, 'r', encoding='utf-8', errors='ignore') as f:
-                    content = f.read()
-                # Strip supportconfig section headers
-                log_lines = []
-                for line in content.splitlines():
-                    if not _SC_SECTION_RE.match(line) and not line.startswith('# /'):
+            # Try section-based extraction first (proper supportconfig with headers)
+            log_content = sc_extract_log_sections(src, var_log_path_prefix)
+            
+            if not log_content:
+                # Fallback: file might be raw log content with minimal headers
+                # Just strip section headers and keep everything else
+                try:
+                    with open(src, 'r', encoding='utf-8', errors='ignore') as f:
+                        content = f.read()
+                    log_lines = []
+                    for line in content.splitlines():
+                        if _SC_SECTION_RE.match(line):
+                            continue
+                        if _SC_COMMAND_RE.match(line):
+                            continue
                         log_lines.append(line)
-                with open(dest_path, 'w', encoding='utf-8') as f:
-                    f.write('\n'.join(log_lines))
-            except Exception:
-                pass
+                    log_content = '\n'.join(log_lines)
+                except Exception:
+                    log_content = ''
+            
+            if log_content.strip():
+                dest_path = os.path.join(sc_root, var_log_name)
+                os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+                try:
+                    with open(dest_path, 'w', encoding='utf-8') as f:
+                        f.write(log_content)
+                    _materialized.append(f"{var_log_name} ({len(log_content)} bytes)")
+                except Exception as e:
+                    _materialized.append(f"{var_log_name} (FAILED: {e})")
 
-    # security.txt contains audit log, secure log, etc.
+    # Rotated messages files (messages-20250415.txt, etc.) — raw syslog, no headers
+    import glob as _glob
+    for rotated_file in _glob.glob(os.path.join(sc_root, 'messages-*.txt')):
+        basename = os.path.basename(rotated_file)  # e.g. messages-20250415.txt
+        # Map to var/log/messages-20250415
+        dest_name = basename.replace('.txt', '')
+        dest_path = os.path.join(sc_root, 'var', 'log', dest_name)
+        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+        try:
+            shutil.copy2(rotated_file, dest_path)
+            sz = os.path.getsize(rotated_file)
+            _materialized.append(f"var/log/{dest_name} ({sz} bytes)")
+        except Exception as e:
+            _materialized.append(f"var/log/{dest_name} (FAILED: {e})")
+
+    # boot.txt — extract only the boot.log / boot.msg section (not dmesg/lsmod/etc.)
+    boot_src = sc_find_file(sc_root, 'boot.txt')
+    if boot_src:
+        boot_log = sc_extract_log_sections(boot_src, '/var/log/boot')
+        if boot_log:
+            _write('var/log/boot.log', boot_log)
+
+    # security-audit.txt — SUSE splits security into separate files
+    # Handle both old-style security.txt and new-style security-*.txt
     security_src = sc_find_file(sc_root, 'security.txt')
+    audit_src = sc_find_file(sc_root, 'security-audit.txt')
+    
+    # Audit log extraction
+    if audit_src:
+        audit_log = sc_extract_log_sections(audit_src, '/var/log/audit')
+        if audit_log:
+            _write('var/log/audit/audit.log', audit_log)
+    elif security_src:
+        audit_log = sc_extract_log_sections(security_src, '/var/log/audit')
+        if audit_log:
+            _write('var/log/audit/audit.log', audit_log)
+    
+    # Secure/auth log extraction
     if security_src:
-        _write('var/log/secure',
-               sc_read_file(sc_root, 'security'))
+        secure_log = sc_extract_log_sections(security_src, '/var/log/secure')
+        if not secure_log:
+            secure_log = sc_extract_log_sections(security_src, '/var/log/auth')
+        if secure_log:
+            _write('var/log/secure', secure_log)
+    
+    # Firewall log
+    if security_src:
+        fw_log = sc_extract_log_sections(security_src, '/var/log/firewall')
+        if fw_log:
+            _write('var/log/firewall', fw_log)
+
+    # journalctl.txt — newer SUSE supportconfigs include journal output
+    journal_src = sc_find_file(sc_root, 'journalctl.txt')
+    if journal_src:
+        os.makedirs(os.path.join(sc_root, 'sos_commands', 'logs'), exist_ok=True)
+        try:
+            with open(journal_src, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read()
+            # Strip section headers
+            log_lines = []
+            for line in content.splitlines():
+                if not _SC_SECTION_RE.match(line) and not _SC_COMMAND_RE.match(line):
+                    log_lines.append(line)
+            with open(os.path.join(sc_root, 'sos_commands', 'logs', 'journalctl_--no-pager'), 'w', encoding='utf-8') as f:
+                f.write('\n'.join(log_lines))
+        except Exception:
+            pass
+
+    # cron.txt — extract cron log entries
+    cron_src = sc_find_file(sc_root, 'cron.txt')
+    if cron_src:
+        try:
+            with open(cron_src, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read()
+            log_lines = []
+            for line in content.splitlines():
+                if not _SC_SECTION_RE.match(line) and not _SC_COMMAND_RE.match(line):
+                    log_lines.append(line)
+            if log_lines:
+                _write('var/log/cron', '\n'.join(log_lines))
+        except Exception:
+            pass
 
     # HA / Pacemaker
     ha_src = sc_find_file(sc_root, 'ha.txt')
@@ -1079,6 +1300,21 @@ def _materialize_supportconfig_paths(sc_root: str):
         _write('sos_commands/general/last_reboot', last_out)
         _write('last', last_out)
 
+    # Log materialization summary
+    logging.info(f"Supportconfig materialization: {len(_materialized)} files created")
+    for item in _materialized:
+        logging.info(f"  Materialized: {item}")
+    
+    # Also list what's now in var/log
+    var_log = os.path.join(sc_root, 'var', 'log')
+    if os.path.isdir(var_log):
+        for root, dirs, files in os.walk(var_log):
+            for f in files:
+                full = os.path.join(root, f)
+                sz = os.path.getsize(full) if os.path.isfile(full) else 0
+                rel = os.path.relpath(full, sc_root)
+                logging.info(f"  var/log contents: {rel} ({sz} bytes)")
+
 
 def detect_hostname(sosreport_path: str, archive_format: str = 'sosreport') -> str:
     """Detect hostname from sosreport or supportconfig"""
@@ -1087,7 +1323,13 @@ def detect_hostname(sosreport_path: str, archive_format: str = 'sosreport') -> s
         sc_hostname = sc_read_file(sosreport_path, 'hostname')
         if sc_hostname:
             return sc_hostname.strip().splitlines()[0].strip()
-        # Try directory name pattern (nts_hostname_YYMMDD)
+        # Fallback: extract from uname output (Linux <hostname> ...)
+        uname_out = sc_read_file(sosreport_path, 'uname')
+        if uname_out:
+            parts = uname_out.strip().split()
+            if len(parts) >= 2 and parts[0] == 'Linux':
+                return parts[1]
+        # Try directory name pattern (nts_hostname_YYMMDD or scc_hostname_YYMMDD)
         dirname = os.path.basename(sosreport_path)
         if dirname.startswith(('nts_', 'scc_')):
             parts = dirname.split('_')
@@ -4141,8 +4383,8 @@ def generate_copy_paste_summary(hostname: str, system_info: dict, sar_anomalies:
     lines.append(f"  Log Entries:   {logs_count:,}")
     if log_summary:
         source_labels = {
-            'messages': 'Messages', 'syslog': 'Syslog', 'secure': 'Secure',
-            'auth': 'Auth.log', 'audit': 'Audit', 'cron': 'Cron',
+            'messages': 'Messages', 'syslog': 'Syslog', 'warn': 'Warn (SUSE)',
+            'secure': 'Secure', 'auth': 'Auth.log', 'audit': 'Audit', 'cron': 'Cron',
             'dmesg': 'Dmesg', 'journal': 'Journalctl', 'kern': 'Kern.log',
             'boot': 'Boot.log', 'maillog': 'Maillog', 'yum_dnf': 'Yum/DNF',
         }
@@ -4795,13 +5037,21 @@ class SARParser:
                     if _is_binary_sa_file(f):
                         continue
                 
-                # Check if it's a text file by reading first line
+                # Check if it's a text file by reading first lines
                 try:
                     with open(f, 'r', encoding='utf-8', errors='ignore') as file:
-                        first_line = file.readline()
-                        # SAR text files start with "Linux" header or have timestamps
-                        if 'Linux' in first_line or '<?xml' in first_line or any(c.isdigit() for c in first_line[:20]):
-                            result.append(f)
+                        # Read first 10 lines — supportconfig SAR may have blank leading lines
+                        for _line_num in range(10):
+                            first_line = file.readline()
+                            if not first_line:
+                                break
+                            first_line = first_line.strip()
+                            if not first_line:
+                                continue  # skip blank lines
+                            # SAR text files start with "Linux" header or have timestamps
+                            if 'Linux' in first_line or '<?xml' in first_line or any(c.isdigit() for c in first_line[:20]):
+                                result.append(f)
+                                break
                 except:
                     pass
             return result
@@ -6191,6 +6441,7 @@ class LogParser:
             'boot': 0,
             'maillog': 0,
             'yum_dnf': 0,
+            'warn': 0,
         }
         self.critical_summary = {}  # Summary by category
         self._boot_time = None  # Calculated lazily by _get_boot_time()
@@ -6293,9 +6544,25 @@ class LogParser:
     def parse_syslog_line(self, line: str) -> Tuple[Optional[datetime], str, str]:
         """Parse syslog format line with smart year detection
         
-        If log month > report month, the log is from the previous year.
-        e.g., if report is Feb 2026 and log is from Nov, it's Nov 2025.
+        Supports:
+          - BSD syslog:  "Jan 15 10:30:01 host prog[pid]: msg"
+          - ISO 8601 (SUSE/rsyslog): "2026-01-15T10:30:01.123456+00:00 host prog[pid]: msg"
+          - ISO 8601 short: "2026-01-15T10:30:01+00:00 host prog[pid]: msg"
+        
+        If log month > report month, the log is from the previous year (BSD format only).
         """
+        # ── ISO 8601 timestamp (SUSE/SLES supportconfig format) ──
+        iso_pattern = r'^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.\d+)?(?:[+-]\d{2}:\d{2}|Z)?\s+(\S+)\s+(\S+?)(?:\[\d+\])?:\s*(.*)$'
+        iso_match = re.match(iso_pattern, line)
+        if iso_match:
+            ts_str, hostname, program, message = iso_match.groups()
+            try:
+                timestamp = datetime.strptime(ts_str, "%Y-%m-%dT%H:%M:%S")
+                return timestamp, program, message
+            except ValueError:
+                pass
+
+        # ── BSD syslog timestamp (RHEL/OL/CentOS format) ──
         pattern = r'^(\w{3})\s+(\d{1,2})\s+(\d{2}:\d{2}:\d{2})\s+(\S+)\s+(\S+?)(?:\[\d+\])?:\s*(.*)$'
         match = re.match(pattern, line)
         
@@ -6415,7 +6682,7 @@ class LogParser:
         """Find all log files including rotated ones, sos_commands outputs, journalctl, dmesg etc.
         
         Covers: messages, syslog, secure, auth.log, audit, cron, kern.log, boot.log,
-                dmesg, journalctl, maillog, yum/dnf logs.
+                dmesg, journalctl, maillog, yum/dnf logs, warn (SUSE).
         """
         import glob
         
@@ -6432,6 +6699,7 @@ class LogParser:
             'boot': [],
             'maillog': [],
             'yum_dnf': [],
+            'warn': [],
         }
         
         var_log = os.path.join(self.sosreport_path, 'var', 'log')
@@ -6447,6 +6715,11 @@ class LogParser:
         found_files['syslog'] = self._glob_log_variants(
             var_log, 'syslog',
             [os.path.join(sos_cmds, 'logs', '*syslog*')]
+        )
+        
+        # ── warn (SUSE/SLES warning log — equivalent of messages for warnings) ──
+        found_files['warn'] = self._glob_log_variants(
+            var_log, 'warn'
         )
         
         # ── secure (RHEL/OL auth log) ──
@@ -7678,7 +7951,6 @@ def create_grafana_dashboard(hostname: str, time_from: datetime = None, time_to:
     # Build dashboard with auto time range
     # Use provided timestamps or fallback to last year
     if time_from and time_to:
-        # Format as ISO 8601 for Grafana
         time_from_str = time_from.strftime("%Y-%m-%dT%H:%M:%S.000Z")
         time_to_str = time_to.strftime("%Y-%m-%dT%H:%M:%S.000Z")
     else:
@@ -8184,6 +8456,38 @@ def main():
                 if os.path.isdir(var_log_path):
                     log_dir_contents = os.listdir(var_log_path)
                 
+                # Supportconfig debug: show what files exist in the extracted root
+                _sc_debug_info = {}
+                if archive_format == 'supportconfig':
+                    _sc_debug_info['sc_txt_files'] = [f for f in os.listdir(sosreport_path) if f.endswith('.txt')]
+                    _sc_debug_info['var_log_contents'] = log_dir_contents
+                    # Walk var/log for all files with sizes
+                    _sc_debug_info['var_log_files'] = {}
+                    if os.path.isdir(var_log_path):
+                        for root_d, dirs, files in os.walk(var_log_path):
+                            for f in files:
+                                full = os.path.join(root_d, f)
+                                rel = os.path.relpath(full, sosreport_path)
+                                _sc_debug_info['var_log_files'][rel] = os.path.getsize(full)
+                    # Check sos_commands/sar
+                    sar_dir = os.path.join(sosreport_path, 'sos_commands', 'sar')
+                    if os.path.isdir(sar_dir):
+                        _sc_debug_info['sar_files'] = {f: os.path.getsize(os.path.join(sar_dir, f)) for f in os.listdir(sar_dir)}
+                    else:
+                        _sc_debug_info['sar_files'] = 'sos_commands/sar/ NOT FOUND'
+                    # Check var/log/sa (where SAR data from sar/ gets copied)
+                    sa_dir = os.path.join(sosreport_path, 'var', 'log', 'sa')
+                    if os.path.isdir(sa_dir):
+                        _sc_debug_info['var_log_sa_files'] = {f: os.path.getsize(os.path.join(sa_dir, f)) for f in os.listdir(sa_dir)}
+                    else:
+                        _sc_debug_info['var_log_sa_files'] = 'var/log/sa/ NOT FOUND'
+                    # Log found files from parser
+                    _lp_found = getattr(log_parser, 'found_files', {})
+                    _sc_debug_info['log_parser_found'] = {k: [os.path.basename(f) for f in v] for k, v in _lp_found.items() if v}
+                    _sc_debug_info['log_parser_summary'] = {k: v for k, v in log_parser.summary.items() if v > 0}
+                    _sc_debug_info['sar_files_found'] = [os.path.basename(f) for f in sar_files_found]
+                    _sc_debug_info['sar_metrics_count'] = len(sar_metrics)
+                
                 progress_bar.progress(70, "Data parsed!")
                 
                 
@@ -8325,6 +8629,11 @@ from(bucket: "{INFLUXDB_BUCKET}")
                     if pushed_logs > 0:
                         _loki_rate = int(pushed_logs / _loki_elapsed) if _loki_elapsed > 0 else 0
                         st.success(f"✅ Pushed {pushed_logs:,} log entries to Loki in {_loki_elapsed:.1f}s ({_loki_rate:,} entries/sec)")
+                        # Flush Loki to ensure old-timestamp data is written to TSDB store
+                        try:
+                            requests.post(f"{LOKI_URL}/flush", timeout=60)
+                        except Exception:
+                            pass
                     else:
                         st.warning(f"⚠️ No log entries pushed to Loki")
                     if loki_info:
@@ -8406,6 +8715,7 @@ from(bucket: "{INFLUXDB_BUCKET}")
                     'total_time': _total_time,
                     'file_size_mb': file_size_mb,
                     'archive_format': archive_format,
+                    'sc_debug_info': _sc_debug_info,
                 }
                 
             except Exception as e:
@@ -9054,8 +9364,8 @@ from(bucket: "{INFLUXDB_BUCKET}")
                 st.subheader("Log Entries")
                 # Show all log sources that have entries
                 log_source_labels = {
-                    'messages': 'Messages', 'syslog': 'Syslog', 'secure': 'Secure',
-                    'auth': 'Auth.log', 'audit': 'Audit', 'cron': 'Cron',
+                    'messages': 'Messages', 'syslog': 'Syslog', 'warn': 'Warn (SUSE)',
+                    'secure': 'Secure', 'auth': 'Auth.log', 'audit': 'Audit', 'cron': 'Cron',
                     'dmesg': 'Dmesg', 'journal': 'Journalctl', 'kern': 'Kern.log',
                     'boot': 'Boot.log', 'maillog': 'Maillog', 'yum_dnf': 'Yum/DNF',
                 }
@@ -9450,6 +9760,41 @@ from(bucket: "{INFLUXDB_BUCKET}")
                 <p><strong>Dashboard:</strong> <a href="{results.get('dashboard', '#')}" target="_blank">Open in new tab ↗</a></p>
             </div>
             """, unsafe_allow_html=True)
+
+            # ===== SUPPORTCONFIG DEBUG (if applicable) =====
+            _sc_debug = _ad.get('sc_debug_info', {})
+            if _sc_debug:
+                st.markdown("---")
+                with st.expander("🔧 Supportconfig Debug Info", expanded=False):
+                    st.write("**Supportconfig .txt files in archive root:**")
+                    st.code('\n'.join(_sc_debug.get('sc_txt_files', ['(none)'])))
+                    
+                    st.write("**Materialized var/log/ files:**")
+                    vl_files = _sc_debug.get('var_log_files', {})
+                    if vl_files:
+                        for fname, sz in sorted(vl_files.items()):
+                            st.text(f"  {fname}: {sz:,} bytes")
+                    else:
+                        st.warning("No files in var/log/ — materialization may have failed")
+                    
+                    st.write("**SAR files (sos_commands/sar/):**")
+                    sar_info = _sc_debug.get('sar_files', {})
+                    if isinstance(sar_info, dict):
+                        for fname, sz in sorted(sar_info.items()):
+                            st.text(f"  {fname}: {sz:,} bytes")
+                    else:
+                        st.warning(str(sar_info))
+                    
+                    st.write(f"**SAR files parsed:** {_sc_debug.get('sar_files_found', [])}")
+                    st.write(f"**SAR metrics count:** {_sc_debug.get('sar_metrics_count', 0)}")
+                    
+                    st.write("**Log parser — found files:**")
+                    for log_type, files in _sc_debug.get('log_parser_found', {}).items():
+                        st.text(f"  {log_type}: {files}")
+                    
+                    st.write("**Log parser — parsed entry counts:**")
+                    for log_type, count in _sc_debug.get('log_parser_summary', {}).items():
+                        st.text(f"  {log_type}: {count:,}")
 
             # ===== PERFORMANCE TIMING BREAKDOWN =====
             st.markdown("---")
