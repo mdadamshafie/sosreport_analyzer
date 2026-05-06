@@ -1,5 +1,5 @@
-"""
-SOSreport & Supportconfig Analyzer V7.2 - Streamlit Web Application
+﻿"""
+SOSreport & Supportconfig Analyzer V8 - Streamlit Web Application
 Upload SOSreport (RHEL/OL/CentOS) or Supportconfig (SUSE/SLES) archives and analyze
 SAR metrics + Logs with automatic Grafana integration.
 
@@ -23,6 +23,13 @@ Includes:
 - NetworkManager deep analysis (NEW in V7)
 - System Health Checks — 30+ categorized checks (V7.1)
 - SUSE Supportconfig archive support — auto-detect format, parse flat .txt files (V7.2)
+- Multi-distro generalization: Ubuntu/Debian dpkg, apt, zypper support (V7.3)
+- Executive TL;DR risk verdict at top of analysis (NEW in V8)
+- Failed systemd services detection (current state at collection time) (NEW in V8)
+- Inode exhaustion detection from df -i (NEW in V8)
+- CPU %steal alerting for cloud VM noisy-neighbor / throttling (NEW in V8)
+- Kernel taint flags decoding (proprietary modules, staging, etc.) (NEW in V8)
+- NTP/Chrony time sync status check (NEW in V8)
 """
 
 import streamlit as st
@@ -649,7 +656,7 @@ _active_sessions_lock = threading.Lock()
 _active_sessions = {}  # session_id -> {hostname, start_time, phase}
 
 st.set_page_config(
-    page_title="SOSreport & Supportconfig Analyzer V7.2",
+    page_title="SOSreport & Supportconfig Analyzer V8",
     
     layout="wide",
     initial_sidebar_state="expanded"
@@ -837,6 +844,19 @@ def extract_sosreport(uploaded_file, progress_bar, status_text=None) -> Tuple[st
                             '/sos_commands/cluster/',
                             '/sos_commands/cloud/',
                             '/sos_commands/cloud_init/',
+                            # Ubuntu/Debian-specific sos_commands
+                            '/sos_commands/apt/',
+                            '/sos_commands/dpkg/',
+                            '/sos_commands/apparmor/',
+                            '/sos_commands/block/',
+                            '/sos_commands/ubuntu/',
+                            # SUSE-specific sos_commands
+                            '/sos_commands/zypper/',
+                            '/sos_commands/registration/',
+                            # V8: NTP/chrony and kernel taint
+                            '/sos_commands/chrony/',
+                            '/sos_commands/ntp/',
+                            '/proc/sys/kernel/tainted',
                             '/etc/kdump.conf',
                             '/var/crash/',
                             '/proc/cmdline',
@@ -849,6 +869,9 @@ def extract_sosreport(uploaded_file, progress_bar, status_text=None) -> Tuple[st
                             '/etc/os-release',
                             '/etc/oracle-release',
                             '/etc/SuSE-release',
+                            # Ubuntu/Debian release files
+                            '/etc/lsb-release',
+                            '/etc/debian_version',
                             '/etc/fstab',
                             '/etc/ssh/sshd_config',
                             '/etc/audit/auditd.conf',
@@ -858,6 +881,9 @@ def extract_sosreport(uploaded_file, progress_bar, status_text=None) -> Tuple[st
                             '/etc/sysconfig/network-scripts/',
                             '/etc/network/interfaces',
                             '/etc/NetworkManager/',
+                            # Ubuntu/Debian package lists
+                            '/installed-debs',
+                            '/installed-snaps',
                             '/hostname',
                             '/uptime',
                             '/date',
@@ -880,6 +906,9 @@ def extract_sosreport(uploaded_file, progress_bar, status_text=None) -> Tuple[st
                             '/sos_commands/subscription_manager', '/sos_commands/yum', '/sos_commands/dnf',
                             '/sos_commands/kdump', '/sos_commands/systemd',
                             '/sos_commands/azure',
+                            '/sos_commands/apt', '/sos_commands/dpkg',
+                            '/sos_commands/apparmor', '/sos_commands/block',
+                            '/sos_commands/zypper', '/sos_commands/registration',
                             '/var/crash',
                             '/etc'
                         ]):
@@ -1613,12 +1642,13 @@ def detect_reboot_history(sosreport_path: str, report_year: int = None, archive_
     if report_year is None:
         report_year = datetime.now().year
     
-    # ── 1. Scan /var/log/messages* for BOOT_IMAGE ────────────────────────
+    # ── 1. Scan /var/log/messages* and /var/log/syslog* for BOOT_IMAGE ──
     var_log = os.path.join(sosreport_path, 'var', 'log')
     msg_files = []
     if os.path.isdir(var_log):
         for fname in sorted(os.listdir(var_log)):
-            if fname.startswith('messages'):
+            # RHEL/OL/CentOS/SUSE use messages, Ubuntu/Debian use syslog
+            if fname.startswith('messages') or fname.startswith('syslog'):
                 msg_files.append(os.path.join(var_log, fname))
     
     # Patterns:  "Nov 29 13:39:20 hostname kernel: ... BOOT_IMAGE=..."
@@ -1769,6 +1799,9 @@ def detect_os_release(sosreport_path: str, archive_format: str = 'sosreport') ->
         os.path.join(sosreport_path, "etc", "os-release"),
         os.path.join(sosreport_path, "etc", "oracle-release"),
         os.path.join(sosreport_path, "etc", "SuSE-release"),
+        # Ubuntu/Debian
+        os.path.join(sosreport_path, "etc", "lsb-release"),
+        os.path.join(sosreport_path, "etc", "debian_version"),
             ]
     
     for rf in release_files:
@@ -1782,6 +1815,24 @@ def detect_os_release(sosreport_path: str, archive_format: str = 'sosreport') ->
                             for line in content.split('\n'):
                                 if line.startswith('PRETTY_NAME='):
                                     return line.split('=', 1)[1].strip('"\'')
+                        # For lsb-release, extract DISTRIB_DESCRIPTION
+                        elif 'lsb-release' in rf:
+                            for line in content.split('\n'):
+                                if line.startswith('DISTRIB_DESCRIPTION='):
+                                    return line.split('=', 1)[1].strip('"\'')
+                            # Fallback: DISTRIB_ID + DISTRIB_RELEASE
+                            distrib_id = ''
+                            distrib_release = ''
+                            for line in content.split('\n'):
+                                if line.startswith('DISTRIB_ID='):
+                                    distrib_id = line.split('=', 1)[1].strip('"\'')
+                                elif line.startswith('DISTRIB_RELEASE='):
+                                    distrib_release = line.split('=', 1)[1].strip('"\'')
+                            if distrib_id:
+                                return f"{distrib_id} {distrib_release}".strip()
+                        # For debian_version, return "Debian X.Y"
+                        elif 'debian_version' in rf:
+                            return f"Debian {content.split(chr(10))[0]}"
                         else:
                             # Return first line for other release files
                             return content.split('\n')[0]
@@ -1802,6 +1853,7 @@ def detect_os_flavor(os_release: str, kernel_version: str = '') -> str:
       'alma'         - AlmaLinux
       'suse'         - SUSE Linux Enterprise (SLES/SLED)
       'ubuntu'       - Ubuntu
+      'debian'       - Debian
       'unknown'      - Unrecognized
     
     This function is designed to be extended: add new elif branches for new distros.
@@ -1819,10 +1871,12 @@ def detect_os_flavor(os_release: str, kernel_version: str = '') -> str:
         return 'rocky'
     elif 'alma' in os_lower:
         return 'alma'
-    elif 'suse' in os_lower or 'sles' in os_lower:
+    elif 'suse' in os_lower or 'sles' in os_lower or 'sled' in os_lower or 'opensuse' in os_lower:
         return 'suse'
     elif 'ubuntu' in os_lower:
         return 'ubuntu'
+    elif 'debian' in os_lower:
+        return 'debian'
     else:
         return 'unknown'
 
@@ -1886,6 +1940,40 @@ OS_FLAVOR_CONFIG = {
             'default': {'outdated': 100, 'very_outdated': 50},
         },
         'subscription_methods': ['SUSEConnect', 'RMT', 'SMT'],
+    },
+    'ubuntu': {
+        'base_kernel_prefixes': ['linux-image-'],
+        'kernel_type_from_version': lambda kver: (
+            'azure' if 'azure' in kver.lower() else
+            'aws' if 'aws' in kver.lower() else
+            'gcp' if 'gcp' in kver.lower() else
+            'generic' if 'generic' in kver.lower() else
+            'lowlatency' if 'lowlatency' in kver.lower() else
+            'standard'
+        ),
+        'staleness_thresholds': {
+            'generic':    {'outdated': 70, 'very_outdated': 40},
+            'azure':      {'outdated': 70, 'very_outdated': 40},
+            'aws':        {'outdated': 70, 'very_outdated': 40},
+            'gcp':        {'outdated': 70, 'very_outdated': 40},
+            'lowlatency': {'outdated': 70, 'very_outdated': 40},
+            'standard':   {'outdated': 70, 'very_outdated': 40},
+        },
+        'subscription_methods': ['apt', 'Ubuntu Pro', 'unattended-upgrades'],
+    },
+    'debian': {
+        'base_kernel_prefixes': ['linux-image-'],
+        'kernel_type_from_version': lambda kver: (
+            'cloud' if 'cloud' in kver.lower() else
+            'rt' if 'rt' in kver.lower() else
+            'standard'
+        ),
+        'staleness_thresholds': {
+            'standard': {'outdated': 70, 'very_outdated': 40},
+            'cloud':    {'outdated': 70, 'very_outdated': 40},
+            'rt':       {'outdated': 70, 'very_outdated': 40},
+        },
+        'subscription_methods': ['apt'],
     },
 }
 # Fallback for unrecognized distros
@@ -2193,7 +2281,7 @@ def detect_df_info(sosreport_path: str, archive_format: str = 'sosreport') -> Li
 
 
 def detect_installed_packages(sosreport_path: str, archive_format: str = 'sosreport') -> dict:
-    """Detect important installed packages from sosreport"""
+    """Detect important installed packages from sosreport (RPM or DPKG based)"""
     packages = {
         'rhui': [],
         'kernel': [],
@@ -2203,7 +2291,7 @@ def detect_installed_packages(sosreport_path: str, archive_format: str = 'sosrep
         'all_packages': []
     }
     
-    # Build list of candidate RPM files
+    # ── RPM-based distros (RHEL, OL, CentOS, Rocky, Alma, SUSE) ────────
     rpm_files = []
     
     # Priority 1: installed-rpms at sosreport root (most reliable, always present)
@@ -2243,6 +2331,70 @@ def detect_installed_packages(sosreport_path: str, archive_format: str = 'sosrep
                             packages['python'].append(pkg_name)
                         elif 'java' in pkg_lower and len(packages['java']) < 5:
                             packages['java'].append(pkg_name)
+                    
+                    if packages['total_count'] > 0:
+                        return packages
+            except:
+                continue
+    
+    # ── DPKG-based distros (Ubuntu, Debian) ────────────────────────────
+    dpkg_files = []
+    
+    # Priority 1: installed-debs at sosreport root
+    installed_debs = os.path.join(sosreport_path, "installed-debs")
+    if os.path.isfile(installed_debs):
+        dpkg_files.append(installed_debs)
+    
+    # Priority 2: sos_commands/dpkg/ directory
+    dpkg_dir = os.path.join(sosreport_path, "sos_commands", "dpkg")
+    if os.path.isdir(dpkg_dir):
+        for f in os.listdir(dpkg_dir):
+            f_lower = f.lower()
+            if 'dpkg' in f_lower and ('list' in f_lower or 'get-selections' in f_lower):
+                dpkg_files.append(os.path.join(dpkg_dir, f))
+    
+    for dpkg_file in dpkg_files:
+        if os.path.isfile(dpkg_file):
+            try:
+                with open(dpkg_file, 'r', encoding='utf-8', errors='ignore') as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        
+                        # dpkg -l format: "ii  package-name  version  arch  description"
+                        # dpkg --get-selections format: "package-name\tinstall"
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            # Skip header lines (lines starting with |, +, Desired=, etc.)
+                            if parts[0] in ('Desired=', '||/', '|', '+') or line.startswith('|') or line.startswith('+'):
+                                continue
+                            
+                            # dpkg -l format: status (ii/rc/etc.) is first column
+                            if len(parts[0]) <= 3 and parts[0].replace('i', '').replace('r', '').replace('c', '').replace('u', '').replace('h', '').replace('n', '').replace('p', '') == '':
+                                pkg_name = parts[1]
+                                # Only count installed packages (status starts with 'i')
+                                if not parts[0].startswith('i'):
+                                    continue
+                            else:
+                                # dpkg --get-selections format
+                                pkg_name = parts[0]
+                                if len(parts) > 1 and parts[-1] == 'deinstall':
+                                    continue
+                            
+                            packages['total_count'] += 1
+                            # Strip :arch suffix (e.g. "linux-image-5.15.0-91-generic:amd64")
+                            pkg_name_clean = pkg_name.split(':')[0]
+                            packages['all_packages'].append(pkg_name_clean)
+                            pkg_lower = pkg_name_clean.lower()
+                            
+                            # Ubuntu/Debian kernel packages start with linux-image-
+                            if pkg_lower.startswith('linux-image-') or pkg_lower.startswith('linux-headers-'):
+                                packages['kernel'].append(pkg_name_clean)
+                            elif 'python' in pkg_lower and len(packages['python']) < 5:
+                                packages['python'].append(pkg_name_clean)
+                            elif 'java' in pkg_lower and len(packages['java']) < 5:
+                                packages['java'].append(pkg_name_clean)
                     
                     if packages['total_count'] > 0:
                         return packages
@@ -3170,6 +3322,85 @@ def detect_cve_advisories(sosreport_path: str, archive_format: str = 'sosreport'
         cve_info['package_manager'] = 'yum'
     
     if not pkg_dir:
+        # ── Ubuntu/Debian: check APT for security updates ──
+        apt_dir = os.path.join(sosreport_path, 'sos_commands', 'apt')
+        if os.path.isdir(apt_dir):
+            cve_info['package_manager'] = 'apt'
+            # Look for apt list --upgradable output
+            for fname in os.listdir(apt_dir):
+                fpath = os.path.join(apt_dir, fname)
+                if 'upgradable' in fname.lower() or 'list' in fname.lower():
+                    content = safe_read(fpath)
+                    if content:
+                        for line in content.split('\n'):
+                            line = line.strip()
+                            if not line or line.startswith('Listing'):
+                                continue
+                            cve_info['update_summary']['total'] += 1
+                            if 'security' in line.lower():
+                                cve_info['update_summary']['security'] += 1
+            
+            # Check for update-notifier info
+            update_avail = os.path.join(sosreport_path, 'var', 'lib', 'update-notifier', 'updates-available')
+            if os.path.isfile(update_avail):
+                content = safe_read(update_avail)
+                if content:
+                    # Format: "X updates can be applied immediately." / "Y of these are security updates."
+                    total_match = re.search(r'(\d+)\s+updates?\s+can\s+be', content)
+                    sec_match = re.search(r'(\d+)\s+of\s+these\s+.*security', content, re.IGNORECASE)
+                    if total_match:
+                        cve_info['update_summary']['total'] = max(
+                            cve_info['update_summary']['total'], int(total_match.group(1)))
+                    if sec_match:
+                        cve_info['update_summary']['security'] = max(
+                            cve_info['update_summary']['security'], int(sec_match.group(1)))
+            
+            # Extract CVE IDs from apt changelogs or security notices
+            apt_history = os.path.join(sosreport_path, 'var', 'log', 'apt', 'history.log')
+            if os.path.isfile(apt_history):
+                content = safe_read(apt_history)
+                if content:
+                    cves = set()
+                    cve_matches = re.findall(r'CVE-\d{4}-\d{4,}', content)
+                    cves.update(cve_matches)
+                    cve_info['cves'] = sorted(list(cves))
+                    cve_info['cve_count'] = len(cves)
+            
+            return cve_info
+        
+        # ── SUSE: check zypper for patches ──
+        zypper_dir = os.path.join(sosreport_path, 'sos_commands', 'zypper')
+        if os.path.isdir(zypper_dir):
+            cve_info['package_manager'] = 'zypper'
+            for fname in os.listdir(zypper_dir):
+                fpath = os.path.join(zypper_dir, fname)
+                if 'patches' in fname.lower() or 'list-patches' in fname.lower():
+                    content = safe_read(fpath)
+                    if content:
+                        for line in content.split('\n'):
+                            line = line.strip()
+                            if not line or '|' not in line:
+                                continue
+                            parts = [p.strip() for p in line.split('|')]
+                            if len(parts) >= 3:
+                                cve_info['update_summary']['total'] += 1
+                                cat = parts[1].lower() if len(parts) > 1 else ''
+                                sev = parts[2].lower() if len(parts) > 2 else ''
+                                if 'security' in cat:
+                                    cve_info['update_summary']['security'] += 1
+                                if 'critical' in sev:
+                                    cve_info['update_summary']['critical'] += 1
+                                elif 'important' in sev:
+                                    cve_info['update_summary']['important'] += 1
+                                elif 'moderate' in sev:
+                                    cve_info['update_summary']['moderate'] += 1
+                        # Extract CVEs
+                        cves = set(re.findall(r'CVE-\d{4}-\d{4,}', content))
+                        cve_info['cves'] = sorted(list(cves))
+                        cve_info['cve_count'] = len(cves)
+                        break
+            return cve_info
+        
         return cve_info
     
     # --- Parse available updates list ---
@@ -3364,6 +3595,78 @@ def detect_patch_compliance(sosreport_path: str, packages_info: dict, kernel_ver
             # Remove the 'no active subscription' finding since RHUI is the subscription method
             compliance['findings'] = [f for f in compliance['findings'] if 'no active subscription' not in f.lower()]
     
+    # ── SUSE subscription check (SUSEConnect / RMT) ──
+    if os_flavor == 'suse' and compliance['subscription_status'] == 'Unknown':
+        suse_sub_files = [
+            os.path.join(sosreport_path, "sos_commands", "registration", "SUSEConnect_--status"),
+            os.path.join(sosreport_path, "sos_commands", "registration", "SUSEConnect_-s"),
+        ]
+        for sf in suse_sub_files:
+            if os.path.isfile(sf):
+                try:
+                    with open(sf, 'r', encoding='utf-8', errors='ignore') as f:
+                        content = f.read()
+                        if '"status":"Registered"' in content or '"Registered"' in content:
+                            compliance['subscription_status'] = 'Registered (SUSEConnect)'
+                        elif '"status":"Not Registered"' in content:
+                            compliance['subscription_status'] = 'Not Registered'
+                            compliance['findings'].append('SUSE system is not registered')
+                        elif content.strip():
+                            compliance['subscription_status'] = 'SUSEConnect configured'
+                except:
+                    pass
+                break
+        # Check zypper repos as fallback
+        if compliance['subscription_status'] == 'Unknown':
+            zypper_repo_files = [
+                os.path.join(sosreport_path, "sos_commands", "zypper", "zypper_repos"),
+                os.path.join(sosreport_path, "sos_commands", "dnf", "zypper_patches"),
+            ]
+            for zf in zypper_repo_files:
+                if os.path.isfile(zf):
+                    try:
+                        with open(zf, 'r', encoding='utf-8', errors='ignore') as f:
+                            content = f.read()
+                            repo_count = sum(1 for line in content.split('\n') if line.strip() and '|' in line)
+                            if repo_count > 0:
+                                compliance['subscription_status'] = 'Repos configured'
+                                compliance['subscription_details'].append(f"{repo_count} zypper repos found")
+                    except:
+                        pass
+                    break
+    
+    # ── Ubuntu/Debian subscription check (Ubuntu Pro / apt repos) ──
+    if os_flavor in ('ubuntu', 'debian') and compliance['subscription_status'] == 'Unknown':
+        # Check for Ubuntu Pro (ubuntu-advantage-tools)
+        ua_status = os.path.join(sosreport_path, "sos_commands", "ubuntu", "pro_status")
+        if not os.path.isfile(ua_status):
+            ua_status = os.path.join(sosreport_path, "sos_commands", "ubuntu", "ua_status")
+        if os.path.isfile(ua_status):
+            try:
+                with open(ua_status, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read()
+                    if 'attached' in content.lower():
+                        compliance['subscription_status'] = 'Ubuntu Pro (attached)'
+                    elif 'not attached' in content.lower() or 'disabled' in content.lower():
+                        compliance['subscription_status'] = 'Ubuntu Pro (not attached)'
+            except:
+                pass
+        
+        # Check apt sources as fallback
+        if compliance['subscription_status'] == 'Unknown':
+            apt_sources = os.path.join(sosreport_path, "etc", "apt", "sources.list")
+            if os.path.isfile(apt_sources):
+                try:
+                    with open(apt_sources, 'r', encoding='utf-8', errors='ignore') as f:
+                        content = f.read()
+                        repo_count = sum(1 for line in content.split('\n') 
+                                        if line.strip() and not line.strip().startswith('#') and 'deb' in line)
+                        if repo_count > 0:
+                            compliance['subscription_status'] = 'APT repos configured'
+                            compliance['subscription_details'].append(f"{repo_count} apt source(s) enabled")
+                except:
+                    pass
+    
     # 2. Check kernel age and reboot status  (OS-flavor-aware)
     kernel_packages = packages_info.get('kernel', [])
     compliance['installed_kernels'] = kernel_packages[:10]
@@ -3421,7 +3724,11 @@ def detect_patch_compliance(sosreport_path: str, packages_info: dict, kernel_ver
     
     # ── Step D: kernel staleness heuristic (flavor-aware thresholds) ──
     if kernel_version and kernel_version != 'N/A':
+        # RHEL/OL/CentOS/SUSE: 5.14.0-427.13.1 → major_update = 427
         kernel_match = re.search(r'(\d+\.\d+\.\d+)-(\d+)\.(\d+)\.(\d+)', kernel_version)
+        if not kernel_match:
+            # Ubuntu/Debian: 5.15.0-91-generic or 6.5.0-14-generic → major_update = 91 or 14
+            kernel_match = re.search(r'(\d+\.\d+\.\d+)-(\d+)', kernel_version)
         if kernel_match:
             major_update = int(kernel_match.group(2))
             thresholds = flavor_cfg['staleness_thresholds'].get(
@@ -3524,6 +3831,126 @@ def detect_patch_compliance(sosreport_path: str, packages_info: dict, kernel_ver
                                         compliance['findings'].append(f'Last update was {days_since} days before sosreport - consider more frequent patching')
                             except:
                                 pass
+            except:
+                continue
+    
+    # ── 3b. APT history for Ubuntu/Debian ──
+    if os_flavor in ('ubuntu', 'debian') and compliance['last_update_info'] == 'N/A':
+        apt_history_files = [
+            os.path.join(sosreport_path, "var", "log", "apt", "history.log"),
+        ]
+        # Also check rotated apt history
+        apt_log_dir = os.path.join(sosreport_path, "var", "log", "apt")
+        if os.path.isdir(apt_log_dir):
+            import glob as _apt_glob
+            apt_history_files.extend(sorted(
+                _apt_glob.glob(os.path.join(apt_log_dir, "history.log.*")),
+                reverse=True
+            ))
+        
+        for ahf in apt_history_files:
+            if not os.path.isfile(ahf):
+                continue
+            try:
+                # Handle .gz compressed rotated logs
+                if ahf.endswith('.gz'):
+                    with gzip.open(ahf, 'rt', encoding='utf-8', errors='ignore') as f:
+                        content = f.read()
+                else:
+                    with open(ahf, 'r', encoding='utf-8', errors='ignore') as f:
+                        content = f.read()
+                
+                # APT history format:
+                #   Start-Date: 2026-01-15  10:30:45
+                #   Commandline: apt-get upgrade -y
+                #   Install: linux-image-5.15.0-91-generic:amd64 (...)
+                #   End-Date: 2026-01-15  10:35:12
+                apt_dates = re.findall(r'Start-Date:\s*(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})', content)
+                if apt_dates:
+                    # Most recent is last entry in the file
+                    last_date_str = apt_dates[-1][0]
+                    compliance['last_update_info'] = f"{last_date_str} (apt)"
+                    
+                    try:
+                        last_update = datetime.strptime(last_date_str, '%Y-%m-%d')
+                        report_date = None
+                        if report_date_str and report_date_str != 'N/A':
+                            report_year_match = re.search(r'(20\d{2})', report_date_str)
+                            report_month_match = re.search(r'(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)', report_date_str, re.IGNORECASE)
+                            report_day_match = re.search(r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2})', report_date_str, re.IGNORECASE)
+                            if report_year_match and report_month_match and report_day_match:
+                                try:
+                                    report_date = datetime.strptime(
+                                        f"{report_year_match.group(1)} {report_month_match.group(1)} {report_day_match.group(1)}",
+                                        "%Y %b %d"
+                                    )
+                                except:
+                                    pass
+                        if not report_date:
+                            report_date = datetime.now()
+                        days_since = (report_date - last_update).days
+                        if days_since < 0:
+                            days_since = 0
+                        compliance['kernel_age_days'] = days_since
+                        if days_since > 180:
+                            compliance['findings'].append(f'Last apt update was {days_since} days before sosreport collection')
+                        elif days_since > 90:
+                            compliance['findings'].append(f'Last apt update was {days_since} days before sosreport - consider more frequent patching')
+                    except:
+                        pass
+                    break  # Found history, stop looking
+            except:
+                continue
+    
+    # ── 3c. Zypper history for SUSE ──
+    if os_flavor == 'suse' and compliance['last_update_info'] == 'N/A':
+        zypper_history_files = [
+            os.path.join(sosreport_path, "var", "log", "zypp", "history"),
+            os.path.join(sosreport_path, "var", "log", "zypper.log"),
+        ]
+        for zhf in zypper_history_files:
+            if not os.path.isfile(zhf):
+                continue
+            try:
+                with open(zhf, 'r', encoding='utf-8', errors='ignore') as f:
+                    lines = f.readlines()
+                # Zypper history format: "2026-01-15 10:30|install|..."
+                zypper_dates = []
+                for line in lines:
+                    dm = re.match(r'^(\d{4}-\d{2}-\d{2})', line)
+                    if dm:
+                        zypper_dates.append(dm.group(1))
+                if zypper_dates:
+                    last_date_str = zypper_dates[-1]
+                    compliance['last_update_info'] = f"{last_date_str} (zypper)"
+                    try:
+                        last_update = datetime.strptime(last_date_str, '%Y-%m-%d')
+                        report_date = None
+                        if report_date_str and report_date_str != 'N/A':
+                            report_year_match = re.search(r'(20\d{2})', report_date_str)
+                            report_month_match = re.search(r'(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)', report_date_str, re.IGNORECASE)
+                            report_day_match = re.search(r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2})', report_date_str, re.IGNORECASE)
+                            if report_year_match and report_month_match and report_day_match:
+                                try:
+                                    report_date = datetime.strptime(
+                                        f"{report_year_match.group(1)} {report_month_match.group(1)} {report_day_match.group(1)}",
+                                        "%Y %b %d"
+                                    )
+                                except:
+                                    pass
+                        if not report_date:
+                            report_date = datetime.now()
+                        days_since = (report_date - last_update).days
+                        if days_since < 0:
+                            days_since = 0
+                        compliance['kernel_age_days'] = days_since
+                        if days_since > 180:
+                            compliance['findings'].append(f'Last zypper update was {days_since} days before sosreport collection')
+                        elif days_since > 90:
+                            compliance['findings'].append(f'Last zypper update was {days_since} days before sosreport - consider more frequent patching')
+                    except:
+                        pass
+                    break
             except:
                 continue
     
@@ -3972,6 +4399,55 @@ def run_system_health_checks(sosreport_path: str, system_info: dict,
     else:
         add("Performance", "System Resource Exhaustion Analysis", "info", "No resource exhaustion")
 
+    # ── V8: Inode Exhaustion ──────────────────────────────────────────
+    inode_info = system_info.get('inode_usage', [])
+    inode_critical = [i for i in inode_info if i.get('inode_used_pct', 0) >= 90]
+    if inode_critical:
+        mounts = ', '.join(f"{i['mountpoint']} ({i['inode_used_pct']}%)" for i in inode_critical)
+        add("Filesystem", "Inode Exhaustion", "critical" if any(i['inode_used_pct'] >= 95 for i in inode_critical) else "warning",
+            f"Inode usage ≥90%: {mounts}")
+    else:
+        add("Filesystem", "Inode Exhaustion", "info", "Inode usage normal")
+
+    # ── V8: Failed Systemd Services ───────────────────────────────────
+    failed_svc = system_info.get('failed_services', {})
+    if failed_svc.get('total_failed', 0) > 0:
+        svc_list = ', '.join(failed_svc['failed_units'][:5])
+        more = f" +{failed_svc['total_failed'] - 5} more" if failed_svc['total_failed'] > 5 else ""
+        add("General Errors", "Failed Systemd Services (current state)", "critical",
+            f"{failed_svc['total_failed']} service(s) in failed state: {svc_list}{more}")
+    else:
+        add("General Errors", "Failed Systemd Services (current state)", "info",
+            "No failed services detected")
+
+    # ── V8: Kernel Taint ──────────────────────────────────────────────
+    taint = system_info.get('kernel_taint', {})
+    if taint.get('tainted'):
+        add("System Config", "Kernel Taint Flags", "warning",
+            f"Kernel tainted (value={taint['value']}, flags={taint['flag_letters']}): {'; '.join(taint['flags'][:3])}")
+    else:
+        add("System Config", "Kernel Taint Flags", "info", "Kernel not tainted")
+
+    # ── V8: NTP/Chrony Time Sync ──────────────────────────────────────
+    time_sync = system_info.get('time_sync', {})
+    if time_sync.get('service'):
+        if time_sync.get('synced') is False:
+            add("System Config", "NTP/Chrony Time Sync", "warning",
+                f"{time_sync['service']}: NOT synchronized — {time_sync.get('details', 'clock drift risk')}")
+        elif time_sync.get('offset_ms') is not None and time_sync['offset_ms'] > 500:
+            add("System Config", "NTP/Chrony Time Sync", "warning",
+                f"{time_sync['service']}: offset {time_sync['offset_ms']:.1f}ms (>500ms threshold)")
+        elif time_sync.get('synced') is True:
+            offset_str = f", offset {time_sync['offset_ms']:.3f}ms" if time_sync.get('offset_ms') is not None else ""
+            add("System Config", "NTP/Chrony Time Sync", "info",
+                f"{time_sync['service']}: synchronized{offset_str}")
+        else:
+            add("System Config", "NTP/Chrony Time Sync", "info",
+                f"{time_sync['service']}: status unknown")
+    else:
+        add("System Config", "NTP/Chrony Time Sync", "warning",
+            "No NTP/chrony/timedatectl data found — time sync status unknown")
+
     # ── Repository Errors ─────────────────────────────────────────────
     # 1. RHUI Connectivity
     rhui_log = _read(os.path.join(sosreport_path, 'var', 'log', 'rhui', 'rhui.log'))
@@ -4038,8 +4514,9 @@ def run_system_health_checks(sosreport_path: str, system_info: dict,
         add("Results", "Check for Qualys presence", "info", "Qualys not found")
 
     # ── SLES ──────────────────────────────────────────────────────────
-    os_flavor = system_info.get('os_release', '').lower()
-    if 'suse' in os_flavor or 'sles' in os_flavor:
+    # Use normalized os_flavor from detect_os_flavor() for reliable matching
+    _detected_flavor = detect_os_flavor(system_info.get('os_release', ''), system_info.get('kernel', ''))
+    if _detected_flavor == 'suse':
         rmt_re = re.compile(r'(RMT|SUSEConnect|registration).*(fail|error|timeout|refused)', re.I)
         suseconnect_log = _read(os.path.join(sosreport_path, 'var', 'log', 'YaST2', 'registration.log'))
         zypper_log = _read(os.path.join(sosreport_path, 'var', 'log', 'zypper.log'), tail=500)
@@ -4051,10 +4528,38 @@ def run_system_health_checks(sosreport_path: str, system_info: dict,
         else:
             add("SLES", "RMT Connectivity", "info", "RMT connectivity OK or not applicable")
 
+    # ── Ubuntu/Debian ─────────────────────────────────────────────────
+    if _detected_flavor in ('ubuntu', 'debian'):
+        # Check APT repo errors
+        apt_log_content = _read(os.path.join(sosreport_path, 'var', 'log', 'apt', 'term.log'), tail=500)
+        apt_history = _read(os.path.join(sosreport_path, 'var', 'log', 'apt', 'history.log'), tail=200)
+        apt_content = apt_log_content + apt_history
+        apt_err_re = re.compile(r'(apt|dpkg).*(fail|error|broken|unmet|Hash Sum mismatch|Could not)', re.I)
+        apt_errs = apt_err_re.findall(apt_content)
+        if apt_errs:
+            add("Ubuntu/Debian", "APT Package Errors", "warning",
+                f"{len(apt_errs)} APT/dpkg error(s) detected")
+        else:
+            add("Ubuntu/Debian", "APT Package Errors", "info", "No APT errors detected")
+        
+        # Check unattended-upgrades
+        unatt_log = _read(os.path.join(sosreport_path, 'var', 'log', 'unattended-upgrades', 'unattended-upgrades.log'), tail=100)
+        if unatt_log:
+            unatt_errs = re.findall(r'(WARNING|ERROR|failed)', unatt_log, re.I)
+            if unatt_errs:
+                add("Ubuntu/Debian", "Unattended Upgrades", "warning",
+                    f"{len(unatt_errs)} unattended-upgrades issue(s)")
+            else:
+                add("Ubuntu/Debian", "Unattended Upgrades", "info", "Unattended upgrades operational")
+
     # ── System Config ─────────────────────────────────────────────────
     # 1. Repositories Analysis
-    repo_errors = re.compile(r'(repo.*error|Cannot find|Errors during downloading|status code: (404|403|500))', re.I)
-    repo_errs = repo_errors.findall(repo_content)
+    # Include APT and zypper errors alongside yum/dnf
+    apt_repo_content = _read(os.path.join(sosreport_path, 'var', 'log', 'apt', 'term.log'), tail=300)
+    zypper_repo_content = _read(os.path.join(sosreport_path, 'var', 'log', 'zypper.log'), tail=300)
+    all_repo_content = repo_content + (apt_repo_content or '') + (zypper_repo_content or '')
+    repo_errors = re.compile(r'(repo.*error|Cannot find|Errors during downloading|status code: (404|403|500)|Hash Sum mismatch|Failed to fetch)', re.I)
+    repo_errs = repo_errors.findall(all_repo_content)
     if repo_errs:
         add("System Config", "Repositories Analysis", "warning",
             f"{len(repo_errs)} repository error(s) detected")
@@ -4297,6 +4802,7 @@ def generate_copy_paste_summary(hostname: str, system_info: dict, sar_anomalies:
         flavor_labels = {
             'oracle_linux': 'Oracle Linux', 'rhel': 'RHEL', 'centos': 'CentOS',
             'rocky': 'Rocky Linux', 'alma': 'AlmaLinux', 'suse': 'SUSE', 'ubuntu': 'Ubuntu',
+            'debian': 'Debian',
         }
         flavor = patch_compliance.get('os_flavor', 'unknown')
         lines.append(f"  OS Flavor:     {flavor_labels.get(flavor, flavor)} ({patch_compliance.get('kernel_type', 'standard').upper()} kernel)")
@@ -4394,7 +4900,7 @@ def generate_copy_paste_summary(hostname: str, system_info: dict, sar_anomalies:
                 lines.append(f"    {label + ':':<15} {count:,}")
     lines.append("")
     lines.append("=" * 70)
-    lines.append(f"  Generated by SOSreport & Supportconfig Analyzer V7.2")
+    lines.append(f"  Generated by SOSreport & Supportconfig Analyzer V8")
     lines.append("=" * 70)
     
     return '\n'.join(lines)
@@ -4710,6 +5216,444 @@ def group_correlations(enriched: list) -> list:
     return result
 
 
+# ============================================================================
+# V8 NEW DETECTION FUNCTIONS
+# ============================================================================
+
+def detect_failed_services(sosreport_path: str, archive_format: str = 'sosreport') -> dict:
+    """Detect systemd services currently in failed state at collection time.
+    
+    Parses systemctl list-units --all output to find units in 'failed' state.
+    This shows what's broken NOW, not just what failed in the past (logs).
+    
+    Returns dict with 'failed_units' list and 'total_failed' count.
+    """
+    result = {'failed_units': [], 'total_failed': 0}
+    
+    systemctl_files = [
+        os.path.join(sosreport_path, "sos_commands", "systemd", "systemctl_list-units_--all"),
+        os.path.join(sosreport_path, "sos_commands", "systemd", "systemctl_list-units"),
+        os.path.join(sosreport_path, "sos_commands", "systemd", "systemctl_--failed"),
+    ]
+    
+    for sf in systemctl_files:
+        if not os.path.isfile(sf):
+            continue
+        try:
+            with open(sf, 'r', encoding='utf-8', errors='ignore') as f:
+                for line in f:
+                    line_stripped = line.strip()
+                    if not line_stripped:
+                        continue
+                    # systemctl output: "● unit.service  loaded failed failed  Description"
+                    # or:               "  unit.service  loaded active running Description"
+                    if 'failed' in line_stripped.lower():
+                        parts = line_stripped.split()
+                        if len(parts) >= 4:
+                            # Unit name might be preceded by ● or ✗
+                            unit_name = parts[0] if not parts[0].startswith(('●', '✗', '*')) else parts[1] if len(parts) > 1 else parts[0]
+                            # Clean up: strip bullet chars
+                            unit_name = unit_name.lstrip('●✗* ')
+                            # Verify it's actually a failed unit (not just a line mentioning "failed")
+                            if any(p.lower() == 'failed' for p in parts[1:5]):
+                                if unit_name.endswith(('.service', '.socket', '.mount', '.timer', '.target', '.path', '.scope', '.slice')):
+                                    result['failed_units'].append(unit_name)
+            if result['failed_units']:
+                break
+        except Exception:
+            continue
+    
+    # Deduplicate
+    result['failed_units'] = sorted(set(result['failed_units']))
+    result['total_failed'] = len(result['failed_units'])
+    return result
+
+
+def detect_inode_usage(sosreport_path: str, archive_format: str = 'sosreport') -> list:
+    """Detect inode usage from df -i output.
+    
+    Inode exhaustion (100% inodes used with free space remaining) is a common
+    root cause of "No space left on device" errors that disk % alone misses.
+    
+    Returns list of dicts with filesystem, inode_used_pct, mountpoint.
+    """
+    inode_info = []
+    
+    df_i_files = [
+        os.path.join(sosreport_path, "sos_commands", "filesys", "df_-ali"),
+        os.path.join(sosreport_path, "sos_commands", "filesys", "df_-i"),
+        os.path.join(sosreport_path, "sos_commands", "filesys", "df_-ih"),
+    ]
+    
+    for df_file in df_i_files:
+        if not os.path.isfile(df_file):
+            continue
+        try:
+            with open(df_file, 'r', encoding='utf-8', errors='ignore') as f:
+                lines = f.readlines()
+            
+            for line in lines[1:]:  # Skip header
+                parts = line.split()
+                if len(parts) < 6:
+                    continue
+                try:
+                    filesystem = parts[0]
+                    use_pct_str = parts[4].rstrip('%')
+                    mountpoint = parts[5]
+                    
+                    # Skip virtual/pseudo filesystems
+                    skip_fs = ['tmpfs', 'devtmpfs', 'overlay', 'sysfs', 'proc', 'cgroup', 'devpts']
+                    if any(fs in filesystem.lower() for fs in skip_fs):
+                        continue
+                    skip_mounts = ['/sys', '/proc', '/dev/', '/run/']
+                    if any(mountpoint.startswith(mp) for mp in skip_mounts):
+                        continue
+                    if mountpoint in ['/dev', '/run', '/sys', '/proc']:
+                        continue
+                    
+                    if use_pct_str == '-' or not use_pct_str:
+                        continue
+                    
+                    inode_pct = int(use_pct_str)
+                    if inode_pct > 0:  # Only track filesystems with inode usage
+                        inode_info.append({
+                            'filesystem': filesystem,
+                            'inodes_total': parts[1],
+                            'inodes_used': parts[2],
+                            'inodes_free': parts[3],
+                            'inode_used_pct': inode_pct,
+                            'mountpoint': mountpoint,
+                        })
+                except (ValueError, IndexError):
+                    continue
+            
+            if inode_info:
+                return inode_info
+        except Exception:
+            continue
+    
+    return inode_info
+
+
+def detect_kernel_taint(sosreport_path: str, archive_format: str = 'sosreport') -> dict:
+    """Decode kernel taint flags from /proc/sys/kernel/tainted.
+    
+    A non-zero taint value means the kernel has loaded out-of-tree or
+    proprietary modules, which may cause vendors to decline support for crashes.
+    
+    Returns dict with 'value' (int), 'tainted' (bool), 'flags' (list of strings).
+    """
+    TAINT_FLAGS = {
+        0:  'Proprietary module loaded (P)',
+        1:  'Module force loaded (F)',
+        2:  'Kernel running on out-of-spec system (S)',
+        3:  'Module force unloaded (R)',
+        4:  'Processor reported MCE (M)',
+        5:  'Bad page referenced (B)',
+        6:  'User requested taint (U)',
+        7:  'ACPI table overridden by user (A)',
+        8:  'Kernel issued warning (W)',
+        9:  'Staging driver loaded (C)',
+        10: 'Workaround for platform firmware bug applied (I)',
+        11: 'Externally-built out-of-tree module loaded (O)',
+        12: 'Unsigned module loaded (E)',
+        13: 'Soft lockup occurred (L)',
+        14: 'Kernel live-patched (K)',
+        15: 'Auxiliary taint (X)',
+        16: 'Struct randomization plugin in use (T)',
+        17: 'In-kernel test used (N)',
+    }
+    
+    result = {'value': 0, 'tainted': False, 'flags': [], 'flag_letters': ''}
+    
+    taint_files = [
+        os.path.join(sosreport_path, 'proc', 'sys', 'kernel', 'tainted'),
+        os.path.join(sosreport_path, 'sos_commands', 'kernel', 'cat_.proc.sys.kernel.tainted'),
+    ]
+    
+    for tf in taint_files:
+        if not os.path.isfile(tf):
+            continue
+        try:
+            with open(tf, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read().strip()
+            if content and content.isdigit():
+                taint_val = int(content)
+                result['value'] = taint_val
+                result['tainted'] = taint_val != 0
+                
+                if taint_val != 0:
+                    flags = []
+                    letters = []
+                    letter_map = {0:'P', 1:'F', 2:'S', 3:'R', 4:'M', 5:'B', 6:'U', 7:'A',
+                                  8:'W', 9:'C', 10:'I', 11:'O', 12:'E', 13:'L', 14:'K',
+                                  15:'X', 16:'T', 17:'N'}
+                    for bit, description in TAINT_FLAGS.items():
+                        if taint_val & (1 << bit):
+                            flags.append(description)
+                            letters.append(letter_map.get(bit, '?'))
+                    result['flags'] = flags
+                    result['flag_letters'] = ''.join(letters)
+                break
+        except Exception:
+            continue
+    
+    return result
+
+
+def detect_time_sync(sosreport_path: str, archive_format: str = 'sosreport') -> dict:
+    """Detect NTP/Chrony time synchronization status.
+    
+    Clock drift causes Kerberos failures, DB replication issues, cluster split-brain,
+    and certificate validation errors. This checks chronyc/ntpstat output.
+    
+    Returns dict with 'service', 'synced', 'offset_ms', 'source', 'details'.
+    """
+    result = {
+        'service': None,
+        'synced': None,
+        'offset_ms': None,
+        'source': None,
+        'stratum': None,
+        'details': '',
+    }
+    
+    # ── Check chrony (modern distros) ──
+    chrony_files = [
+        os.path.join(sosreport_path, 'sos_commands', 'chrony', 'chronyc_tracking'),
+        os.path.join(sosreport_path, 'sos_commands', 'chrony', 'chronyc_sources'),
+    ]
+    
+    for cf in chrony_files:
+        if not os.path.isfile(cf):
+            continue
+        try:
+            with open(cf, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read()
+            result['service'] = 'chrony'
+            
+            if 'tracking' in cf.lower():
+                for line in content.splitlines():
+                    line_lower = line.lower().strip()
+                    if line_lower.startswith('reference id'):
+                        ref = line.split(':', 1)[1].strip() if ':' in line else ''
+                        result['source'] = ref
+                        if '127.127.1.1' in ref or 'local' in ref.lower():
+                            result['synced'] = False
+                            result['details'] = 'Synced to LOCAL clock only (no external source)'
+                    elif line_lower.startswith('stratum'):
+                        try:
+                            result['stratum'] = int(line.split(':', 1)[1].strip())
+                        except (ValueError, IndexError):
+                            pass
+                    elif 'system time' in line_lower and 'offset' in line_lower:
+                        # "System time     : 0.000001234 seconds slow of NTP time"
+                        try:
+                            offset_match = re.search(r'([\d.]+)\s+seconds', line)
+                            if offset_match:
+                                offset_sec = float(offset_match.group(1))
+                                result['offset_ms'] = round(offset_sec * 1000, 3)
+                                if result['synced'] is None:
+                                    result['synced'] = True
+                        except (ValueError, IndexError):
+                            pass
+                    elif 'last offset' in line_lower:
+                        try:
+                            offset_match = re.search(r'([+-]?[\d.]+)', line.split(':', 1)[1])
+                            if offset_match:
+                                offset_sec = abs(float(offset_match.group(1)))
+                                if result['offset_ms'] is None:
+                                    result['offset_ms'] = round(offset_sec * 1000, 3)
+                        except (ValueError, IndexError):
+                            pass
+                
+                if result['stratum'] and result['stratum'] >= 16:
+                    result['synced'] = False
+                    result['details'] = 'Stratum 16 — not synchronized'
+                elif result['synced'] is None and result['source']:
+                    result['synced'] = True
+            break
+        except Exception:
+            continue
+    
+    # ── Check NTP (legacy) ──
+    if result['service'] is None:
+        ntp_files = [
+            os.path.join(sosreport_path, 'sos_commands', 'ntp', 'ntpstat'),
+            os.path.join(sosreport_path, 'sos_commands', 'ntp', 'ntpq_-pn'),
+        ]
+        for nf in ntp_files:
+            if not os.path.isfile(nf):
+                continue
+            try:
+                with open(nf, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read()
+                result['service'] = 'ntp'
+                
+                if 'ntpstat' in nf.lower():
+                    if 'synchronised' in content.lower() or 'synchronized' in content.lower():
+                        result['synced'] = True
+                        # Extract offset
+                        offset_match = re.search(r'time correct to within (\d+)\s*ms', content)
+                        if offset_match:
+                            result['offset_ms'] = float(offset_match.group(1))
+                    elif 'unsynchronised' in content.lower() or 'unsynchronized' in content.lower():
+                        result['synced'] = False
+                        result['details'] = 'NTP unsynchronized'
+                    
+                    stratum_match = re.search(r'stratum\s+(\d+)', content)
+                    if stratum_match:
+                        result['stratum'] = int(stratum_match.group(1))
+                break
+            except Exception:
+                continue
+    
+    # ── Check timedatectl (systemd) as fallback ──
+    if result['service'] is None:
+        timedatectl_files = [
+            os.path.join(sosreport_path, 'sos_commands', 'date', 'timedatectl'),
+            os.path.join(sosreport_path, 'sos_commands', 'general', 'timedatectl'),
+        ]
+        for tf in timedatectl_files:
+            if not os.path.isfile(tf):
+                continue
+            try:
+                with open(tf, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read()
+                for line in content.splitlines():
+                    line_lower = line.lower().strip()
+                    if 'ntp synchronized' in line_lower or 'system clock synchronized' in line_lower:
+                        if 'yes' in line_lower:
+                            result['synced'] = True
+                            result['service'] = 'systemd-timesyncd'
+                        elif 'no' in line_lower:
+                            result['synced'] = False
+                            result['service'] = 'systemd-timesyncd'
+                            result['details'] = 'NTP not synchronized (timedatectl)'
+                    elif 'ntp service' in line_lower or 'ntp enabled' in line_lower:
+                        if 'inactive' in line_lower or 'no' in line_lower:
+                            result['details'] = 'NTP service not active'
+                break
+            except Exception:
+                continue
+    
+    return result
+
+
+def generate_executive_summary(system_info: dict, sar_anomalies: dict,
+                               critical_events: list, health_checks: dict,
+                               patch_compliance: dict) -> dict:
+    """Generate a 3-5 bullet executive TL;DR with overall risk level.
+    
+    Returns dict with 'risk_level' (GREEN/YELLOW/RED), 'bullets' (list of strings),
+    and 'risk_score' (0-10).
+    """
+    bullets = []
+    risk_score = 0  # 0=pristine, 10=on fire
+    
+    # ── Critical events ──
+    if critical_events:
+        crit_count = sum(1 for e in critical_events if e.get('severity') == 'critical')
+        if crit_count > 0:
+            # Find top category
+            cat_counts = {}
+            for e in critical_events:
+                if e.get('severity') == 'critical':
+                    cat = e.get('category', 'Unknown')
+                    cat_counts[cat] = cat_counts.get(cat, 0) + 1
+            top_cat = max(cat_counts, key=cat_counts.get) if cat_counts else 'Unknown'
+            bullets.append(f"🔴 {crit_count} critical event(s) detected — top category: {top_cat}")
+            risk_score += min(crit_count, 4)  # Cap at 4
+        
+        oom_count = sum(1 for e in critical_events 
+                       if e.get('category') == 'Memory/OOM' and e.get('severity') == 'critical')
+        if oom_count > 0:
+            bullets.append(f"🧠 {oom_count} OOM kill(s) — system ran out of memory")
+            risk_score += 2
+    
+    # ── Disk space ──
+    df_info = system_info.get('df_info', [])
+    exhausted = [fs for fs in df_info if fs.get('use_percent', 0) >= 95]
+    if exhausted:
+        mounts = ', '.join(fs.get('mountpoint', '?') for fs in exhausted)
+        bullets.append(f"💾 Disk ≥95% full: {mounts}")
+        risk_score += 2
+    
+    # ── Inode exhaustion ──
+    inode_info = system_info.get('inode_usage', [])
+    inode_critical = [i for i in inode_info if i.get('inode_used_pct', 0) >= 95]
+    if inode_critical:
+        mounts = ', '.join(i.get('mountpoint', '?') for i in inode_critical)
+        bullets.append(f"📁 Inode exhaustion ≥95%: {mounts}")
+        risk_score += 2
+    
+    # ── Crash dumps ──
+    crash_count = system_info.get('crash_dumps', {}).get('total_count', 0)
+    if crash_count > 0:
+        bullets.append(f"💥 {crash_count} crash dump(s) found — kernel crashed")
+        risk_score += 3
+    
+    # ── Kernel taint ──
+    taint = system_info.get('kernel_taint', {})
+    if taint.get('tainted'):
+        bullets.append(f"⚠️ Kernel tainted ({taint.get('flag_letters', '?')}) — out-of-tree/proprietary modules loaded")
+        risk_score += 1
+    
+    # ── Patch compliance ──
+    if patch_compliance:
+        if patch_compliance.get('kernel_status') == 'Very Outdated':
+            bullets.append(f"📦 Kernel very outdated — {patch_compliance.get('kernel_type', '').upper()} update level below threshold")
+            risk_score += 2
+        if patch_compliance.get('reboot_required'):
+            bullets.append(f"🔄 Reboot required — running kernel is not the latest installed")
+            risk_score += 1
+    
+    # ── CPU steal (cloud VMs) ──
+    steal_info = sar_anomalies.get('steal', {})
+    if steal_info.get('avg_steal', 0) > 2:
+        bullets.append(f"☁️ CPU steal avg {steal_info['avg_steal']}% (peak {steal_info['max_steal']}%) — noisy neighbor or throttling")
+        risk_score += 2
+    
+    # ── Time sync ──
+    time_sync = system_info.get('time_sync', {})
+    if time_sync.get('synced') is False:
+        bullets.append(f"🕐 NTP not synchronized — clock drift risk ({time_sync.get('details', '')})")
+        risk_score += 1
+    
+    # ── Failed services ──
+    failed_svc = system_info.get('failed_services', {})
+    if failed_svc.get('total_failed', 0) > 0:
+        top_3 = ', '.join(failed_svc['failed_units'][:3])
+        more = f" +{failed_svc['total_failed'] - 3} more" if failed_svc['total_failed'] > 3 else ""
+        bullets.append(f"🔧 {failed_svc['total_failed']} failed service(s): {top_3}{more}")
+        risk_score += 1
+    
+    # ── Health check critical count ──
+    if health_checks:
+        hc_crit = sum(1 for cat in health_checks.values() for f in cat if f['severity'] == 'critical')
+        if hc_crit > 5 and not any('critical event' in b for b in bullets):
+            bullets.append(f"🔍 {hc_crit} critical health check findings")
+    
+    # If nothing bad found
+    if not bullets:
+        bullets.append("✅ No critical issues detected — system appears healthy")
+    
+    # Determine risk level
+    risk_score = min(risk_score, 10)
+    if risk_score >= 5:
+        risk_level = 'RED'
+    elif risk_score >= 2:
+        risk_level = 'YELLOW'
+    else:
+        risk_level = 'GREEN'
+    
+    return {
+        'risk_level': risk_level,
+        'risk_score': risk_score,
+        'bullets': bullets[:8],  # Cap at 8 bullets
+    }
+
+
 def get_system_info(sosreport_path: str, archive_format: str = 'sosreport') -> dict:
     """Get all system information from sosreport or supportconfig (like xsos)"""
     _af = archive_format
@@ -4735,6 +5679,11 @@ def get_system_info(sosreport_path: str, archive_format: str = 'sosreport') -> d
         'reboot_history': detect_reboot_history(sosreport_path, archive_format=_af),
         'kernel_cmdline': detect_kernel_cmdline(sosreport_path, _af),
         'sysctl': detect_sysctl_tuning(sosreport_path, _af),
+        # V8 additions
+        'failed_services': detect_failed_services(sosreport_path, _af),
+        'inode_usage': detect_inode_usage(sosreport_path, _af),
+        'kernel_taint': detect_kernel_taint(sosreport_path, _af),
+        'time_sync': detect_time_sync(sosreport_path, _af),
         '_archive_format': archive_format,
     }
 
@@ -4749,11 +5698,13 @@ def analyze_sar_anomalies(sar_metrics: List[dict]) -> dict:
         'memory': {'max_usage': 0, 'max_time': None, 'avg_usage': 0, 'samples': 0},
         'disk': {'max_util': 0, 'max_time': None, 'max_device': '', 'samples': 0},
         'network': {'max_rx': 0, 'max_tx': 0, 'max_time': None, 'max_interface': '', 'samples': 0},
-        'load': {'max_load1': 0, 'max_load5': 0, 'max_load15': 0, 'max_time': None, 'max_blocked': 0, 'samples': 0}
+        'load': {'max_load1': 0, 'max_load5': 0, 'max_load15': 0, 'max_time': None, 'max_blocked': 0, 'samples': 0},
+        'steal': {'max_steal': 0, 'avg_steal': 0, 'max_time': None, 'samples': 0},  # V8
     }
     
     cpu_totals = []
     mem_totals = []
+    steal_totals = []  # V8: track steal for cloud VM alerting
     
     for m in sar_metrics:
         measurement = m.get('measurement', '')
@@ -4773,6 +5724,15 @@ def analyze_sar_anomalies(sar_metrics: List[dict]) -> dict:
                 if usage > anomalies['cpu']['max_usage']:
                     anomalies['cpu']['max_usage'] = round(usage, 2)
                     anomalies['cpu']['max_time'] = ts
+                
+                # V8: Track steal time for cloud VM alerting
+                steal = fields.get('pct_steal', 0)
+                if steal > 0:
+                    steal_totals.append(steal)
+                    anomalies['steal']['samples'] += 1
+                    if steal > anomalies['steal']['max_steal']:
+                        anomalies['steal']['max_steal'] = round(steal, 2)
+                        anomalies['steal']['max_time'] = ts
         
         elif measurement == 'sar_memory':
             mem_used = fields.get('pct_memused', 0)
@@ -4826,6 +5786,8 @@ def analyze_sar_anomalies(sar_metrics: List[dict]) -> dict:
         anomalies['cpu']['avg_usage'] = round(sum(cpu_totals) / len(cpu_totals), 2)
     if mem_totals:
         anomalies['memory']['avg_usage'] = round(sum(mem_totals) / len(mem_totals), 2)
+    if steal_totals:
+        anomalies['steal']['avg_steal'] = round(sum(steal_totals) / len(steal_totals), 2)
     
     return anomalies
 
@@ -6795,6 +7757,20 @@ class LogParser:
         found_files['yum_dnf'].extend(self._glob_log_variants(var_log, 'yum.log'))
         found_files['yum_dnf'].extend(self._glob_log_variants(var_log, 'dnf.log'))
         
+        # ── apt logs (Ubuntu/Debian package management) ──
+        apt_log_dir = os.path.join(var_log, 'apt')
+        if os.path.isdir(apt_log_dir):
+            found_files['yum_dnf'].extend(self._glob_log_variants(apt_log_dir, 'history.log'))
+            found_files['yum_dnf'].extend(self._glob_log_variants(apt_log_dir, 'term.log'))
+        
+        # ── zypper logs (SUSE package management) ──
+        zypper_log = os.path.join(var_log, 'zypper.log')
+        if os.path.isfile(zypper_log):
+            found_files['yum_dnf'].append(zypper_log)
+        zypp_history = os.path.join(var_log, 'zypp', 'history')
+        if os.path.isfile(zypp_history):
+            found_files['yum_dnf'].append(zypp_history)
+        
         # Filter to only existing files (not directories) and remove duplicates
         for key in found_files:
             found_files[key] = list(set([f for f in found_files[key] if os.path.isfile(f)]))
@@ -8115,7 +9091,7 @@ def main():
         if cleaned > 0:
             logging.info(f"Startup: cleaned {cleaned} stale temp dirs")
     
-    st.markdown('<h1 class="main-header">📊 SOSreport & Supportconfig Analyzer V7.2</h1>', unsafe_allow_html=True)
+    st.markdown('<h1 class="main-header">📊 SOSreport & Supportconfig Analyzer V8</h1>', unsafe_allow_html=True)
     st.markdown("---")
     
     # Sidebar
@@ -8542,6 +9518,15 @@ def main():
                     health_checks=health_checks,
                 )
                 
+                # ---- V8: Generate executive TL;DR ----
+                exec_summary = generate_executive_summary(
+                    system_info=system_info,
+                    sar_anomalies=sar_anomalies,
+                    critical_events=critical_events,
+                    health_checks=health_checks,
+                    patch_compliance=patch_compliance,
+                )
+                
                 progress_bar.progress(75, "Analysis complete! Pushing data...")
                 
                 # ============= DATA UPLOAD =============
@@ -8710,6 +9695,7 @@ from(bucket: "{INFLUXDB_BUCKET}")
                     'patch_compliance': patch_compliance,
                     'health_checks': health_checks,
                     'summary_text': summary_text,
+                    'exec_summary': exec_summary,
                     'push_results': results,
                     'timings': dict(_timings),
                     'total_time': _total_time,
@@ -8771,6 +9757,29 @@ from(bucket: "{INFLUXDB_BUCKET}")
             _fmt_badge = "🟢 Supportconfig (SUSE)" if _archive_format == 'supportconfig' else "🔵 SOSreport"
             st.header(f" Analysis Summary — {_fmt_badge}")
 
+            # ============= V8: EXECUTIVE TL;DR ========================
+            _exec = _ad.get('exec_summary', {})
+            if _exec:
+                _risk = _exec.get('risk_level', 'GREEN')
+                _risk_icons = {'RED': '🔴', 'YELLOW': '🟡', 'GREEN': '🟢'}
+                _risk_colors = {'RED': '#f8d7da', 'YELLOW': '#fff3cd', 'GREEN': '#d4edda'}
+                _risk_borders = {'RED': '#f5c6cb', 'YELLOW': '#ffc107', 'GREEN': '#c3e6cb'}
+                _risk_icon = _risk_icons.get(_risk, '⚪')
+                _bg = _risk_colors.get(_risk, '#f0f2f6')
+                _border = _risk_borders.get(_risk, '#dee2e6')
+                
+                _bullets_html = ''.join(f'<div style="padding: 2px 0;">{b}</div>' for b in _exec.get('bullets', []))
+                st.markdown(f"""
+                <div style="background-color: {_bg}; border: 2px solid {_border}; border-radius: 8px; padding: 12px 16px; margin: 8px 0 16px 0;">
+                    <div style="font-size: 1.1rem; font-weight: bold; margin-bottom: 8px;">
+                        {_risk_icon} Risk Assessment: <strong>{_risk}</strong> (score: {_exec.get('risk_score', 0)}/10)
+                    </div>
+                    <div style="font-size: 0.95rem;">
+                        {_bullets_html}
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
             # ============= BASIC SYSTEM INFO (like xsos) =============
             st.subheader(" Basic System Information")
 
@@ -8815,6 +9824,22 @@ from(bucket: "{INFLUXDB_BUCKET}")
                 if cpu_info.get('sockets'):
                     st.markdown(f"**Sockets/Threads:** `{cpu_info.get('sockets', 'N/A')} sockets, {cpu_info.get('threads_per_core', 'N/A')} threads/core`")
                 st.markdown(f"**SELinux:** `{selinux_status}`")
+                # V8: Kernel taint
+                _taint = system_info.get('kernel_taint', {})
+                if _taint.get('tainted'):
+                    st.markdown(f"**Kernel Taint:** 🟡 `{_taint['flag_letters']}` — {', '.join(_taint['flags'][:2])}")
+                else:
+                    st.markdown(f"**Kernel Taint:** 🟢 `Clean (0)`")
+                # V8: Time sync
+                _ts = system_info.get('time_sync', {})
+                if _ts.get('service'):
+                    _ts_icon = "🟢" if _ts.get('synced') else "🔴" if _ts.get('synced') is False else "🟡"
+                    _ts_detail = f"offset {_ts['offset_ms']:.1f}ms" if _ts.get('offset_ms') is not None else _ts.get('details', '')
+                    st.markdown(f"**Time Sync:** {_ts_icon} `{_ts['service']}` {_ts_detail}")
+                # V8: Failed services
+                _fsvc = system_info.get('failed_services', {})
+                if _fsvc.get('total_failed', 0) > 0:
+                    st.markdown(f"**Failed Services:** 🔴 `{_fsvc['total_failed']}` — {', '.join(_fsvc['failed_units'][:3])}")
                 # Kdump status - simple one-liner
                 kdump_status = kdump_info.get('enabled', 'Unknown')
                 kdump_icon = "🟢" if kdump_info.get('operational') else "🔴" if kdump_info.get('operational') is False else "⚪"
@@ -9314,6 +10339,21 @@ from(bucket: "{INFLUXDB_BUCKET}")
                     if net_time:
                         st.caption(f"Peak at: {net_time.strftime('%Y-%m-%d %H:%M')}")
 
+            # V8: CPU Steal alert (cloud VMs)
+            steal_info = sar_anomalies.get('steal', {})
+            if steal_info.get('samples', 0) > 0 and steal_info.get('max_steal', 0) > 0:
+                _steal_avg = steal_info.get('avg_steal', 0)
+                _steal_max = steal_info.get('max_steal', 0)
+                _steal_time = steal_info.get('max_time')
+                _steal_icon = "🔴" if _steal_avg > 5 else "🟡" if _steal_avg > 2 else "🟢"
+                st.markdown(f"##### {_steal_icon} CPU Steal: Avg={_steal_avg}% | Peak={_steal_max}%")
+                if _steal_avg > 2:
+                    _cloud = system_info.get('cloud', {})
+                    _provider = _cloud.get('provider_label', 'Cloud') if _cloud.get('provider') else 'Host'
+                    st.warning(f"⚠️ Sustained CPU steal >2% — indicates {_provider} host contention or VM throttling. Consider VM resize or migration.")
+                if _steal_time:
+                    st.caption(f"Peak steal at: {_steal_time.strftime('%Y-%m-%d %H:%M')}")
+
             st.markdown("---")
 
             # ============= DATA TOTALS =============
@@ -9546,7 +10586,7 @@ from(bucket: "{INFLUXDB_BUCKET}")
             flavor_labels = {
                 'oracle_linux': 'Oracle Linux', 'rhel': 'RHEL', 'centos': 'CentOS',
                 'rocky': 'Rocky Linux', 'alma': 'AlmaLinux', 'suse': 'SUSE', 'ubuntu': 'Ubuntu',
-                'unknown': 'Unknown'
+                'debian': 'Debian', 'unknown': 'Unknown'
             }
             flavor_label = flavor_labels.get(detected_flavor, detected_flavor)
             kernel_track = patch_compliance.get('kernel_type', 'standard').upper()
@@ -9874,7 +10914,7 @@ from(bucket: "{INFLUXDB_BUCKET}")
     st.markdown("---")
     st.markdown(
         "<div style='text-align: center; color: gray;'>"
-        "SOSreport & Supportconfig Analyzer V7.2 | Powered by Streamlit, InfluxDB, Loki & Grafana | System Info + Anomaly Detection + Critical Events + Patch Compliance + Cloud Detection"
+        "SOSreport & Supportconfig Analyzer V8 | Powered by Streamlit, InfluxDB, Loki & Grafana | System Info + Anomaly Detection + Critical Events + Patch Compliance + Cloud Detection"
         "</div>",
         unsafe_allow_html=True
     )
