@@ -11,9 +11,13 @@ RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 # ── Stage 2: runtime ─────────────────────────────────────────
 FROM python:3.11-slim
 
-# System-level packages needed at runtime (none today, placeholder)
+# System-level packages needed at runtime
+#   - curl: health checks
+#   - sysstat: provides 'sadf' to decode binary sa* files from Ubuntu/Debian
+#     sosreports (Ubuntu's sos plugin often ships binary sa data only, not XML)
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
+        sysstat \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy pre-built Python packages from builder

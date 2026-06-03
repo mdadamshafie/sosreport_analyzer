@@ -826,6 +826,7 @@ def extract_sosreport(uploaded_file, progress_bar, status_text=None) -> Tuple[st
                             '/var/log/sa/',
                             '/var/log/sysstat/',
                             '/sos_commands/sar/',
+                            '/sos_commands/sysstat/',  # Ubuntu/Debian sos plugin
                             '/sos_commands/logs/',
                             '/sos_commands/auditd/',
                             '/sos_commands/date/',
@@ -908,7 +909,7 @@ def extract_sosreport(uploaded_file, progress_bar, status_text=None) -> Tuple[st
                                 files_to_extract.append(member)
                         elif member.isdir() and any(p in name for p in [
                             '/var/log/sa', '/var/log/sysstat', '/var/log/audit', '/var/log', '/var',
-                            '/sos_commands/sar', '/sos_commands/logs', '/sos_commands',
+                            '/sos_commands/sar', '/sos_commands/sysstat', '/sos_commands/logs', '/sos_commands',
                             '/sos_commands/date', '/sos_commands/general', '/sos_commands/host',
                             '/sos_commands/process',
                             '/sos_commands/subscription_manager', '/sos_commands/yum', '/sos_commands/dnf',
@@ -6071,12 +6072,102 @@ class SARParser:
                 all_files.extend(new_files)
                 sources_used.append("var/log/sysstat/")
         
+        # Source 4: sos_commands/sysstat/ — Ubuntu/Debian sos plugin output
+        # Ubuntu's sos uses the 'sysstat' plugin (not 'sar'), which puts XML/JSON SAR
+        # outputs here instead of sos_commands/sar/.  Without this, Ubuntu sosreports
+        # show no SAR graphs even when the data was collected.
+        sos_sysstat_path = os.path.join(self.sosreport_path, "sos_commands", "sysstat", "*")
+        sos_sysstat_files = glob.glob(sos_sysstat_path)
+        sos_sysstat_files = filter_sar_files(sos_sysstat_files, allow_xml=True)
+        if sos_sysstat_files:
+            existing_basenames = {os.path.basename(f) for f in all_files}
+            new_files = [f for f in sos_sysstat_files if os.path.basename(f) not in existing_basenames]
+            if new_files:
+                all_files.extend(new_files)
+                sources_used.append("sos_commands/sysstat/")
+        
+        # Source 5 (fallback): decode binary sa* files with sadf
+        # Ubuntu/Debian sosreports sometimes contain ONLY binary 'sa01'/'sa20251015'
+        # files with no XML or text 'sar*' output. If we have no parseable files yet,
+        # try invoking the local 'sadf' binary to convert them to XML on the fly.
+        if not all_files:
+            decoded = self._sadf_decode_binary_files()
+            if decoded:
+                all_files.extend(decoded)
+                sources_used.append("sadf-decoded binary sa*")
+        
         if sources_used:
             self.sar_source = " + ".join(sources_used)
         else:
             self.sar_source = "none"
         
         return all_files
+    
+    def _sadf_decode_binary_files(self) -> List[str]:
+        """Decode binary sa* files with the local 'sadf' command (sysstat).
+        
+        Ubuntu's sos plugin often captures /var/log/sysstat/sa* binary files but
+        does NOT run sadf to produce XML. Without decoding we get zero metrics.
+        This method calls 'sadf -x' on each binary file to produce XML output we
+        can then parse. Requires the sysstat package in the container.
+        
+        Returns list of generated XML file paths (or empty list if sadf missing).
+        """
+        import glob, subprocess, shutil as _shutil
+        
+        sadf_bin = _shutil.which('sadf')
+        if not sadf_bin:
+            logging.warning("sadf binary not found — cannot decode binary sa* files")
+            return []
+        
+        # Locate candidate binary files
+        bin_candidates = []
+        for sa_dir in [os.path.join(self.sosreport_path, 'var', 'log', 'sysstat'),
+                       os.path.join(self.sosreport_path, 'var', 'log', 'sa'),
+                       os.path.join(self.sosreport_path, 'sos_commands', 'sysstat'),
+                       os.path.join(self.sosreport_path, 'sos_commands', 'sar')]:
+            if os.path.isdir(sa_dir):
+                for f in os.listdir(sa_dir):
+                    full = os.path.join(sa_dir, f)
+                    if not os.path.isfile(full):
+                        continue
+                    # Match sa01, sa20251015 etc. — binary sysstat data files
+                    if re.match(r'^sa\d+$', f):
+                        bin_candidates.append(full)
+        
+        if not bin_candidates:
+            return []
+        
+        # Output to a temp dir inside the sosreport tree
+        out_dir = os.path.join(self.sosreport_path, '_sadf_decoded')
+        os.makedirs(out_dir, exist_ok=True)
+        
+        decoded_files = []
+        for bin_file in bin_candidates:
+            base = os.path.basename(bin_file)
+            xml_out = os.path.join(out_dir, f'{base}.xml')
+            try:
+                # sadf -x produces XML on stdout; -- -A means "show ALL stats"
+                result = subprocess.run(
+                    [sadf_bin, '-x', '--', '-A', bin_file],
+                    capture_output=True, timeout=60
+                )
+                if result.returncode == 0 and result.stdout:
+                    with open(xml_out, 'wb') as fh:
+                        fh.write(result.stdout)
+                    decoded_files.append(xml_out)
+                    logging.info(f"sadf decoded {base} → {len(result.stdout):,} bytes XML")
+                else:
+                    err_msg = result.stderr.decode('utf-8', errors='ignore')[:200] if result.stderr else ''
+                    logging.warning(f"sadf failed on {base}: rc={result.returncode} {err_msg}")
+            except subprocess.TimeoutExpired:
+                logging.warning(f"sadf timed out on {base}")
+            except Exception as e:
+                logging.warning(f"sadf error on {base}: {e}")
+        
+        if decoded_files:
+            logging.info(f"sadf decoded {len(decoded_files)} binary sa* files from Ubuntu/Debian sosreport")
+        return decoded_files
     
     def parse_date_from_header(self, line: str) -> Optional[str]:
         """Extract date from SAR header"""
@@ -6670,21 +6761,29 @@ class SARParser:
             
             # Method 3: Get date from filename as fallback
             if not file_date:
-                match = re.search(r'sa(\d{2})', basename)
-                if match:
-                    day = int(match.group(1))
-                    year = self.report_year
-                    month = self.report_month if self.report_month else 2
-                    report_day = self.report_day
-                    
-                    # If SAR file day > report day, it's from previous month
-                    if report_day and day > report_day:
-                        month = month - 1 if month > 1 else 12
-                        if month == 12:
-                            year = year - 1
-                    
-                    file_date = f"{year}-{month:02d}-{day:02d}"
-                    xml_debug_info.append(f"From filename: day={day} -> {file_date}")
+                # Newer sysstat (Ubuntu 22.04+) uses date-stamped filenames: sa20251015 or sa20251015.xml
+                m_full = re.search(r'sa(\d{4})(\d{2})(\d{2})', basename)
+                if m_full:
+                    y, mo, d = m_full.groups()
+                    file_date = f"{y}-{mo}-{d}"
+                    xml_debug_info.append(f"From filename (date-stamped): {file_date}")
+                else:
+                    # Legacy format: sa01, sa02 (day of month only)
+                    match = re.search(r'sa(\d{2})(?!\d)', basename)
+                    if match:
+                        day = int(match.group(1))
+                        year = self.report_year
+                        month = self.report_month if self.report_month else 2
+                        report_day = self.report_day
+                        
+                        # If SAR file day > report day, it's from previous month
+                        if report_day and day > report_day:
+                            month = month - 1 if month > 1 else 12
+                            if month == 12:
+                                year = year - 1
+                        
+                        file_date = f"{year}-{month:02d}-{day:02d}"
+                        xml_debug_info.append(f"From filename: day={day} -> {file_date}")
             
             if not file_date:
                 xml_debug_info.append("No date found in XML")
