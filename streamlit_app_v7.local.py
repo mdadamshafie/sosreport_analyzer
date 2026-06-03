@@ -817,6 +817,7 @@ def extract_sosreport(uploaded_file, progress_bar, status_text=None) -> Tuple[st
                         name = member.name
                         if any(p in name for p in [
                             '/var/log/sa/',
+                            '/var/log/sysstat/',
                             '/sos_commands/sar/',
                             '/sos_commands/logs/',
                             '/sos_commands/auditd/',
@@ -899,7 +900,7 @@ def extract_sosreport(uploaded_file, progress_bar, status_text=None) -> Tuple[st
                             if len(os.path.join(temp_dir, name)) < 250:
                                 files_to_extract.append(member)
                         elif member.isdir() and any(p in name for p in [
-                            '/var/log/sa', '/var/log/audit', '/var/log', '/var',
+                            '/var/log/sa', '/var/log/sysstat', '/var/log/audit', '/var/log', '/var',
                             '/sos_commands/sar', '/sos_commands/logs', '/sos_commands',
                             '/sos_commands/date', '/sos_commands/general', '/sos_commands/host',
                             '/sos_commands/process',
@@ -6046,6 +6047,22 @@ class SARParser:
             if new_files:
                 all_files.extend(new_files)
                 sources_used.append("var/log/sa/")
+        
+        # Source 3: var/log/sysstat/ — Ubuntu/Debian sysstat default path
+        # Ubuntu/Debian use /var/log/sysstat/ instead of /var/log/sa/
+        var_sysstat_text = glob.glob(os.path.join(self.sosreport_path, "var", "log", "sysstat", "sar*"))
+        var_sysstat_text = filter_sar_files(var_sysstat_text, allow_xml=False)
+        
+        var_sysstat_other = glob.glob(os.path.join(self.sosreport_path, "var", "log", "sysstat", "sa[0-9]*"))
+        var_sysstat_other = filter_sar_files(var_sysstat_other, allow_xml=True)
+        
+        var_sysstat_all = list(set(var_sysstat_text + var_sysstat_other))
+        if var_sysstat_all:
+            existing_basenames = {os.path.basename(f) for f in all_files}
+            new_files = [f for f in var_sysstat_all if os.path.basename(f) not in existing_basenames]
+            if new_files:
+                all_files.extend(new_files)
+                sources_used.append("var/log/sysstat/")
         
         if sources_used:
             self.sar_source = " + ".join(sources_used)
