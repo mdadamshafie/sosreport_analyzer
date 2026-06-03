@@ -892,6 +892,8 @@ def extract_sosreport(uploaded_file, progress_bar, status_text=None) -> Tuple[st
                             '/etc/sysconfig/network-scripts/',
                             '/etc/network/interfaces',
                             '/etc/NetworkManager/',
+                            # Debian/Ubuntu APT config (incl. deb822 sources.list.d/*.sources on Debian 12+)
+                            '/etc/apt/',
                             # Ubuntu/Debian package lists
                             '/installed-debs',
                             '/installed-snaps',
@@ -1813,6 +1815,9 @@ def detect_os_release(sosreport_path: str, archive_format: str = 'sosreport') ->
         os.path.join(sosreport_path, "etc", "SuSE-release"),
         # Ubuntu/Debian
         os.path.join(sosreport_path, "etc", "lsb-release"),
+        # sos `release` plugin output (used when /etc/lsb-release is a broken symlink, common on Debian)
+        os.path.join(sosreport_path, "sos_commands", "release", "lsb_release_-a"),
+        os.path.join(sosreport_path, "sos_commands", "release", "lsb_release"),
         os.path.join(sosreport_path, "etc", "debian_version"),
             ]
     
@@ -1827,12 +1832,21 @@ def detect_os_release(sosreport_path: str, archive_format: str = 'sosreport') ->
                             for line in content.split('\n'):
                                 if line.startswith('PRETTY_NAME='):
                                     return line.split('=', 1)[1].strip('"\'')
-                        # For lsb-release, extract DISTRIB_DESCRIPTION
-                        elif 'lsb-release' in rf:
+                        # For lsb-release file (KEY=VALUE) and `lsb_release -a` output ("Key: value")
+                        elif 'lsb-release' in rf or 'lsb_release' in rf:
+                            # `lsb_release -a` style: "Description:\tDebian GNU/Linux 12 (bookworm)"
+                            desc_match = re.search(r'^\s*Description:\s*(.+)$', content, re.MULTILINE)
+                            if desc_match:
+                                return desc_match.group(1).strip()
+                            distrib_id_match = re.search(r'^\s*Distributor ID:\s*(.+)$', content, re.MULTILINE)
+                            release_match = re.search(r'^\s*Release:\s*(.+)$', content, re.MULTILINE)
+                            if distrib_id_match:
+                                rel = release_match.group(1).strip() if release_match else ''
+                                return f"{distrib_id_match.group(1).strip()} {rel}".strip()
+                            # KEY=VALUE style (/etc/lsb-release)
                             for line in content.split('\n'):
                                 if line.startswith('DISTRIB_DESCRIPTION='):
                                     return line.split('=', 1)[1].strip('"\'')
-                            # Fallback: DISTRIB_ID + DISTRIB_RELEASE
                             distrib_id = ''
                             distrib_release = ''
                             for line in content.split('\n'):
@@ -3699,18 +3713,34 @@ def detect_patch_compliance(sosreport_path: str, packages_info: dict, kernel_ver
         
         # Check apt sources as fallback
         if compliance['subscription_status'] == 'Unknown':
-            apt_sources = os.path.join(sosreport_path, "etc", "apt", "sources.list")
-            if os.path.isfile(apt_sources):
+            apt_source_paths = [os.path.join(sosreport_path, "etc", "apt", "sources.list")]
+            apt_d_dir = os.path.join(sosreport_path, "etc", "apt", "sources.list.d")
+            if os.path.isdir(apt_d_dir):
+                import glob as _apt_d_glob
+                apt_source_paths.extend(_apt_d_glob.glob(os.path.join(apt_d_dir, "*.list")))
+                # Debian 12+ uses the deb822 format with .sources extension
+                apt_source_paths.extend(_apt_d_glob.glob(os.path.join(apt_d_dir, "*.sources")))
+            repo_count = 0
+            for _ap in apt_source_paths:
+                if not os.path.isfile(_ap):
+                    continue
                 try:
-                    with open(apt_sources, 'r', encoding='utf-8', errors='ignore') as f:
-                        content = f.read()
-                        repo_count = sum(1 for line in content.split('\n') 
-                                        if line.strip() and not line.strip().startswith('#') and 'deb' in line)
-                        if repo_count > 0:
-                            compliance['subscription_status'] = 'APT repos configured'
-                            compliance['subscription_details'].append(f"{repo_count} apt source(s) enabled")
+                    with open(_ap, 'r', encoding='utf-8', errors='ignore') as f:
+                        for line in f:
+                            s = line.strip()
+                            if not s or s.startswith('#'):
+                                continue
+                            # Classic one-line: "deb http://... suite components"
+                            if s.startswith('deb ') or s.startswith('deb-src '):
+                                repo_count += 1
+                            # deb822: "Types: deb" / "Types: deb deb-src"
+                            elif s.lower().startswith('types:') and 'deb' in s.lower():
+                                repo_count += 1
                 except:
                     pass
+            if repo_count > 0:
+                compliance['subscription_status'] = 'APT repos configured'
+                compliance['subscription_details'].append(f"{repo_count} apt source(s) enabled")
     
     # 2. Check kernel age and reboot status  (OS-flavor-aware)
     kernel_packages = packages_info.get('kernel', [])
