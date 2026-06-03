@@ -435,7 +435,12 @@ LOG_PATTERNS = {
     ],
     "Security & Antivirus": [
         r'authentication\sfailure', r'FAILED\sLOGIN', r'AVC\sdenial',
-        r'segfault\sat.*libcrypto', r'pam_unix.*authentication\sfailure'
+        r'segfault\sat.*libcrypto', r'pam_unix.*authentication\sfailure',
+        # Ubuntu AppArmor denials (equivalent to SELinux AVC denials)
+        r'apparmor="DENIED"', r'apparmor=DENIED',
+        r'audit.*apparmor=.?DENIED',
+        # Ubuntu UFW firewall blocks
+        r'\[UFW\s+BLOCK\]', r'\[UFW\s+AUDIT\]',
     ],
     "Service & Systemd": [
         r'systemd:\sFailed\sto\sstart', r'Dependency\sfailed\sfor',
@@ -486,6 +491,8 @@ def _build_prefilter_keywords():
         # Security
         'authentication failure', 'FAILED LOGIN', 'AVC denial',
         'segfault at', 'pam_unix',
+        # Ubuntu AppArmor + UFW
+        'apparmor=', '[UFW BLOCK]', '[UFW AUDIT]',
         # Service & Systemd
         'Failed to start', 'Dependency failed', 'failed state',
         'coredump', 'dumped core', 'repeated too quickly',
@@ -7787,6 +7794,10 @@ class LogParser:
         zypp_history = os.path.join(var_log, 'zypp', 'history')
         if os.path.isfile(zypp_history):
             found_files['yum_dnf'].append(zypp_history)
+        
+        # ── ufw (Ubuntu firewall) — log into kern/syslog category since UFW writes to kern.log ──
+        # UFW also has its own /var/log/ufw.log on some setups
+        found_files['kern'].extend(self._glob_log_variants(var_log, 'ufw.log'))
         
         # Filter to only existing files (not directories) and remove duplicates
         for key in found_files:
