@@ -859,6 +859,8 @@ def extract_sosreport(uploaded_file, progress_bar, status_text=None) -> Tuple[st
                             '/sos_commands/apparmor/',
                             '/sos_commands/block/',
                             '/sos_commands/ubuntu/',
+                            '/sos_commands/snap/',
+                            '/sos_commands/release/',
                             # SUSE-specific sos_commands
                             '/sos_commands/zypper/',
                             '/sos_commands/registration/',
@@ -917,6 +919,7 @@ def extract_sosreport(uploaded_file, progress_bar, status_text=None) -> Tuple[st
                             '/sos_commands/azure',
                             '/sos_commands/apt', '/sos_commands/dpkg',
                             '/sos_commands/apparmor', '/sos_commands/block',
+                            '/sos_commands/snap', '/sos_commands/release',
                             '/sos_commands/zypper', '/sos_commands/registration',
                             '/var/crash',
                             '/etc'
@@ -2939,6 +2942,9 @@ def detect_cloud_provider(sosreport_path: str, archive_format: str = 'sosreport'
             pass
     
     cloud_status = os.path.join(sosreport_path, 'sos_commands', 'cloud_init', 'cloud-init_status_--long')
+    if not os.path.isfile(cloud_status):
+        # Newer Ubuntu sos plugin produces a short 'cloud-init_status' file (no --long)
+        cloud_status = os.path.join(sosreport_path, 'sos_commands', 'cloud_init', 'cloud-init_status')
     if os.path.isfile(cloud_status):
         try:
             with open(cloud_status, 'r', errors='ignore') as f:
@@ -3646,20 +3652,50 @@ def detect_patch_compliance(sosreport_path: str, packages_info: dict, kernel_ver
     
     # ── Ubuntu/Debian subscription check (Ubuntu Pro / apt repos) ──
     if os_flavor in ('ubuntu', 'debian') and compliance['subscription_status'] == 'Unknown':
-        # Check for Ubuntu Pro (ubuntu-advantage-tools)
-        ua_status = os.path.join(sosreport_path, "sos_commands", "ubuntu", "pro_status")
-        if not os.path.isfile(ua_status):
-            ua_status = os.path.join(sosreport_path, "sos_commands", "ubuntu", "ua_status")
-        if os.path.isfile(ua_status):
+        # Modern Ubuntu (24.04+) uses 'ubuntu-security-status' which clearly states
+        # "is/is NOT attached to an Ubuntu Pro subscription".
+        sec_status = os.path.join(
+            sosreport_path, "sos_commands", "ubuntu",
+            "ubuntu-security-status_--thirdparty_--unavailable"
+        )
+        if os.path.isfile(sec_status):
             try:
-                with open(ua_status, 'r', encoding='utf-8', errors='ignore') as f:
-                    content = f.read()
-                    if 'attached' in content.lower():
-                        compliance['subscription_status'] = 'Ubuntu Pro (attached)'
-                    elif 'not attached' in content.lower() or 'disabled' in content.lower():
-                        compliance['subscription_status'] = 'Ubuntu Pro (not attached)'
-            except:
+                with open(sec_status, 'r', encoding='utf-8', errors='ignore') as f:
+                    sec_content = f.read()
+                if 'NOT attached to an Ubuntu Pro' in sec_content:
+                    compliance['subscription_status'] = 'Ubuntu Pro (not attached)'
+                elif 'attached to an Ubuntu Pro' in sec_content:
+                    compliance['subscription_status'] = 'Ubuntu Pro (attached)'
+                # Extract "X packages from <repo>" lines for context
+                for _line in sec_content.splitlines():
+                    _ls = _line.strip()
+                    if 'packages from' in _ls.lower() and 'packages installed' not in _ls.lower():
+                        compliance['subscription_details'].append(_ls[:120])
+                # Capture security patching timeline
+                _m = re.search(r'security patching for .+? until\s+(\d{4})', sec_content)
+                if _m:
+                    compliance['subscription_details'].append(f"Standard security support until {_m.group(1)}")
+                _m2 = re.search(r"esm-infra.*?until\s+(\d{4})", sec_content, re.I)
+                if _m2:
+                    compliance['subscription_details'].append(f"Ubuntu Pro ESM extends support until {_m2.group(1)}")
+            except Exception:
                 pass
+        
+        # Legacy `pro_status` / `ua_status` files (older Ubuntu releases)
+        if compliance['subscription_status'] == 'Unknown':
+            ua_status = os.path.join(sosreport_path, "sos_commands", "ubuntu", "pro_status")
+            if not os.path.isfile(ua_status):
+                ua_status = os.path.join(sosreport_path, "sos_commands", "ubuntu", "ua_status")
+            if os.path.isfile(ua_status):
+                try:
+                    with open(ua_status, 'r', encoding='utf-8', errors='ignore') as f:
+                        content = f.read()
+                        if 'attached' in content.lower() and 'not attached' not in content.lower():
+                            compliance['subscription_status'] = 'Ubuntu Pro (attached)'
+                        elif 'not attached' in content.lower() or 'disabled' in content.lower():
+                            compliance['subscription_status'] = 'Ubuntu Pro (not attached)'
+                except:
+                    pass
         
         # Check apt sources as fallback
         if compliance['subscription_status'] == 'Unknown':
@@ -4560,6 +4596,49 @@ def run_system_health_checks(sosreport_path: str, system_info: dict,
                     f"{len(unatt_errs)} unattended-upgrades issue(s)")
             else:
                 add("Ubuntu/Debian", "Unattended Upgrades", "info", "Unattended upgrades operational")
+        
+        # apt-get check — flags broken dependencies / unmet package state
+        apt_check = _read(os.path.join(sosreport_path, 'sos_commands', 'apt', 'apt-get_check'))
+        if apt_check:
+            if re.search(r'(broken|unmet dependencies|E:\s)', apt_check, re.I):
+                add("Ubuntu/Debian", "APT Dependency State", "critical",
+                    "apt-get check reports broken packages or unmet dependencies")
+            else:
+                add("Ubuntu/Debian", "APT Dependency State", "info",
+                    "apt-get check passes — no broken packages")
+        
+        # HWE kernel support status — Ubuntu's Hardware Enablement Stack
+        hwe = _read(os.path.join(sosreport_path, 'sos_commands', 'ubuntu', 'hwe-support-status_--verbose'))
+        if hwe:
+            _hwe_first = hwe.strip().splitlines()[0] if hwe.strip() else ''
+            if 'no longer supported' in hwe.lower() or 'end of life' in hwe.lower():
+                add("Ubuntu/Debian", "HWE Kernel Support", "critical",
+                    f"HWE kernel support has ended: {_hwe_first[:150]}")
+            elif 'not running a system with' in hwe.lower():
+                add("Ubuntu/Debian", "HWE Kernel Support", "info",
+                    f"GA kernel (no HWE) — {_hwe_first[:150]}")
+            else:
+                add("Ubuntu/Debian", "HWE Kernel Support", "info", _hwe_first[:200])
+        
+        # cloud-init runtime errors (cloud-init-output.log captures stdout/stderr of all stages)
+        ci_output = _read(os.path.join(sosreport_path, 'var', 'log', 'cloud-init-output.log'), tail=300)
+        if ci_output:
+            ci_errs = re.findall(r'(?:error|fail|exception|traceback)', ci_output, re.I)
+            if len(ci_errs) > 3:
+                add("Ubuntu/Debian", "cloud-init Output Errors", "warning",
+                    f"{len(ci_errs)} error/fail/traceback hits in cloud-init-output.log")
+            else:
+                add("Ubuntu/Debian", "cloud-init Output Errors", "info",
+                    "cloud-init-output.log clean")
+        
+        # snap package issues (Ubuntu specific package manager)
+        snap_status = _read(os.path.join(sosreport_path, 'sos_commands', 'snap', 'systemctl_status_snapd'))
+        if snap_status:
+            if 'active (running)' in snap_status.lower():
+                add("Ubuntu/Debian", "Snap Daemon (snapd)", "info", "snapd active and running")
+            elif 'inactive' in snap_status.lower() or 'failed' in snap_status.lower():
+                add("Ubuntu/Debian", "Snap Daemon (snapd)", "warning",
+                    "snapd is inactive or failed — snap packages may not update")
 
     # ── System Config ─────────────────────────────────────────────────
     # 1. Repositories Analysis
