@@ -9889,8 +9889,28 @@ from(bucket: "{INFLUXDB_BUCKET}")
                         st.success(f"✅ Dashboard created!")
                         st.markdown(f"🔗 [Open Dashboard]({dashboard_url})")
                     else:
-                        st.warning("⚠️ Dashboard creation failed — check Grafana connectivity and API key. "
-                                   "View container logs: `docker compose -f docker-compose.all.yml logs app`")
+                        # Diagnose the failure so the user knows what to fix
+                        _diag = []
+                        _gh_ok, _gh_msg = check_grafana_health()
+                        _diag.append(f"Grafana health: {'🟢' if _gh_ok else '🔴'} {_gh_msg}")
+                        _key = _get_grafana_api_key()
+                        _diag.append(f"API key provisioned: {'🟢 yes' if _key else '🔴 no (auto-provision failed)'}")
+                        try:
+                            _ds_resp = requests.get(
+                                f"{GRAFANA_URL}/api/datasources",
+                                headers={"Authorization": f"Bearer {_key}"} if _key else {},
+                                timeout=5,
+                            )
+                            if _ds_resp.status_code == 200:
+                                _ds = _ds_resp.json()
+                                _influx = any(d.get('type') == 'influxdb' for d in _ds)
+                                _loki = any(d.get('type') == 'loki' for d in _ds)
+                                _diag.append(f"Datasources: InfluxDB {'🟢' if _influx else '🔴'} | Loki {'🟢' if _loki else '🔴'}")
+                            else:
+                                _diag.append(f"Datasources query: HTTP {_ds_resp.status_code}")
+                        except Exception as _de:
+                            _diag.append(f"Datasources query failed: {_de}")
+                        st.warning("⚠️ Dashboard creation failed.\n\n" + "\n".join(f"- {d}" for d in _diag))
                 
                 progress_bar.progress(100, "Complete!")
                 _timings['_total'] = _time.time() - _total_start
@@ -10015,6 +10035,33 @@ from(bucket: "{INFLUXDB_BUCKET}")
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
+
+            # ============= GRAFANA DASHBOARD (persistent — embedded + link) =============
+            _dashboard_url = results.get('dashboard') if isinstance(results, dict) else None
+            if _dashboard_url:
+                st.markdown("---")
+                _gh_col1, _gh_col2 = st.columns([3, 1])
+                with _gh_col1:
+                    st.subheader("📊 Grafana Dashboard")
+                with _gh_col2:
+                    st.markdown(
+                        f'<div style="text-align:right; padding-top:8px;">'
+                        f'<a href="{_dashboard_url}" target="_blank" '
+                        f'style="background-color:#ff4b4b; color:white; padding:6px 14px; '
+                        f'border-radius:6px; text-decoration:none; font-weight:bold;">'
+                        f'🔗 Open in New Tab</a></div>',
+                        unsafe_allow_html=True,
+                    )
+                # Build embed URL with kiosk mode (hides Grafana nav). The dashboard URL
+                # already contains the time range as query params from create_grafana_dashboard().
+                _embed_url = _dashboard_url
+                _embed_url += ('&' if '?' in _embed_url else '?') + 'kiosk=tv&theme=light'
+                with st.expander("📊 Embedded view (toggle to show/hide)", expanded=True):
+                    components.iframe(_embed_url, height=900, scrolling=True)
+                    st.caption(
+                        f"If the dashboard appears empty, click the link above or check that the "
+                        f"time range in Grafana matches your sosreport data. URL: `{_dashboard_url}`"
+                    )
 
             # ============= BASIC SYSTEM INFO (like xsos) =============
             st.subheader(" Basic System Information")

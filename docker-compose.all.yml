@@ -99,6 +99,9 @@ services:
       - GRAFANA_URL=http://grafana:3000
       - GRAFANA_EXTERNAL_URL=http://localhost:3000
       - GRAFANA_API_KEY=${GRAFANA_API_KEY:-}
+    volumes:
+      # Bind-mount the app source so edits hot-reload without rebuild
+      - ./streamlit_app_v7.local.py:/app/streamlit_app.py:ro
     depends_on:
       influxdb:
         condition: service_healthy
